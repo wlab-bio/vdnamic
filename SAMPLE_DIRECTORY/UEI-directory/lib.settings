@@ -1,0 +1,16 @@
+-source_for ..//RAWDATA_PATH//i31sub_R1.fastq
+-source_rev ..//RAWDATA_PATH//i31sub_R2.fastq
+-seqform_rev U_GCTNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNTGA_2:39
+-seqform_for U_NWNNNNWWSWNNNWSWNNNWSWWNNNWNGCG_0:31|U_AGGNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNAGC_39:76
+-seqform_for U_WNNNNWNSWNWNWNWSNNNSWNNWWWNNATG_0:31|U_AGGNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNAGC_41:78
+-min_mean_qual 30
+-filter_umi0_amp_len 25
+-inference_dim 3
+-min_uei_per_umi 2
+-min_reads_per_assoc 2
+-min_assoc_per_umi 1
+-max_eig_cuts 10
+-inference_eignum 50
+-u0 *,*,1
+-u1 *,*,2
+-u2 *,*,0
