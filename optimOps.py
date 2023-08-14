@@ -196,6 +196,10 @@ def farthest_pt(ctr_assignments,pt_ctr_dists,ctr_pt_indices,ctr_memberships,coor
 
 def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
     sysOps.globaldatapath = str(globaldatapath)
+    try:
+        os.mkdir(sysOps.globaldatapath + 'tmp')
+    except:
+        pass
     while True: # check for kill-switch
         handshake_filename = None
         while True: # await instructions
@@ -1060,10 +1064,6 @@ def fill_params(params):
         params['-ncpus'] = int(params['-ncpus'][0])
     else:
         params['-ncpus'] = mp.cpu_count()-1
-    if '-merge_levels' in params:
-        params['-merge_levels'] = int(params['-merge_levels'][0])
-    else:
-        params['-merge_levels'] = 3
     if '-init_min_contig' in params:
         params['-init_min_contig'] = int(params['-init_min_contig'][0])
     else:
@@ -1276,8 +1276,6 @@ def run_GSE(output_name, params):
                 status[in_subset] = 1
                 np.savetxt(sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt',np.concatenate([status,FINAL_RES],axis=1),delimiter=',',fmt='%i,' + ','.join(['%.10e']*this_GSEobj.spat_dims))
         
-        #clique = get_clique(this_GSEobj,num_subsets,percentile=99)
-        
         if not sysOps.check_file_exists('evecs.npy'):
             res_mat = list()
             sysOps.throw_status('Loading results.')
@@ -1316,67 +1314,6 @@ def run_GSE(output_name, params):
         spec_GSEobj(this_GSEobj, output_name)
     get_clusters(this_GSEobj, output_name)
     print_final_results(output_name,inference_dim) 
-    
-def get_clique(this_GSEobj,num_subsets,percentile=None):
-    all_index_key = list()
-    for sub_index in range(num_subsets):
-        all_index_key.append(np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) + '//index_key.txt',delimiter=',',dtype=np.int64)[:,1])
-    if len(all_index_key) == 0:
-        sysOps.throw_status('Error len(all_index_key) = ' + str(len(all_index_key)))
-        sysOps.exitProgram()
-    pairwise = np.zeros([num_subsets,num_subsets],dtype=np.float64)
-    rowgrid = np.zeros(pairwise.shape,dtype=np.int64)
-    colgrid = np.zeros(pairwise.shape,dtype=np.int64)
-    redundancy_lookup = np.zeros(this_GSEobj.Npts,dtype=np.bool_)
-    pt_lookup_i = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-    pt_lookup_j = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-    for i in range(num_subsets):
-        pt_lookup_i[:] = -1
-        pt_lookup_i[all_index_key[i]] = np.arange(all_index_key[i].shape[0])
-        redundancy_lookup[all_index_key[i]] = True
-        rowgrid[i,:] = i
-        colgrid[:,i] = i
-        Xpts_i = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(i) + '//subGSEoutput.txt',delimiter=',',dtype=np.float64)[:,1:(this_GSEobj.spat_dims+1)]
-        for j in range(i):
-            pt_lookup_j[:] = -1
-            pt_lookup_j[all_index_key[j]] = np.arange(all_index_key[j].shape[0])
-            shared_global_inds = np.where(np.multiply(pt_lookup_i>=0,pt_lookup_j>=0))[0]
-            Xpts_j = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(j) + '//subGSEoutput.txt',delimiter=',',dtype=np.float64)[:,1:(this_GSEobj.spat_dims+1)]
-            if shared_global_inds.shape[0] > this_GSEobj.spat_dims:
-                shared_X_i = Xpts_i[pt_lookup_i[shared_global_inds],:]
-                shared_X_j = Xpts_j[pt_lookup_j[shared_global_inds],:]
-                for d in range(this_GSEobj.spat_dims):
-                    shared_X_i[:,d] -= np.mean(shared_X_i[:,d])
-                    shared_X_j[:,d] -= np.mean(shared_X_j[:,d])
-                    shared_X_i[:,d] /= LA.norm(shared_X_i[:,d])
-                    shared_X_j[:,d] /= LA.norm(shared_X_j[:,d])
-                pairwise[i,j] = np.power(np.abs(LA.det(shared_X_i.T.dot(shared_X_j))),1.0/this_GSEobj.spat_dims)
-        pairwise[i,i] = 0.5 # will be multiplied by 2 when transpose added
-        redundancy_lookup[:] = False
-    distance_matrix = 1.0 - (pairwise+pairwise.T)
-    np.savetxt(sysOps.globaldatapath + 'distance_matrix.txt',distance_matrix,delimiter=',',fmt='%.10e')
-    distances_1d = distance_matrix[np.triu_indices(distance_matrix.shape[0], k=1)]
-    print(str(distances_1d))
-    # Calculate the pth percentile
-    percentile_dist = np.percentile(distances_1d, percentile)
-    sysOps.throw_status('Percentile ' + str(percentile) + ' distance = ' + str(percentile_dist))
-    # Create a graph
-    G = nx.Graph()
-    # Add nodes
-    num_nodes = len(distance_matrix)
-    G.add_nodes_from(range(num_nodes))
-    
-    # Add edges where distance is less than or equal to percentile_dist
-    for i in range(num_nodes):
-        for j in range(i+1, num_nodes):  # we only need to consider upper triangle due to symmetry
-            if distance_matrix[i][j] <= percentile_dist:
-                G.add_edge(i, j)
-    
-    # Find the maximum clique
-    cliques = nx.find_cliques(G)
-    max_clique = max(cliques, key=len)
-    np.savetxt(sysOps.globaldatapath + 'clique.txt',max_clique,delimiter=',',fmt='%i')
-    return max_clique
     
     
 def full_gse(output_name, params):
