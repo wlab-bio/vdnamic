@@ -1,5 +1,4 @@
 import masterProcesses
-import summaryAnalysis
 import sysOps
 import sys
 import optimOps
@@ -28,9 +27,9 @@ if __name__ == '__main__':
     
     if sys.argv[start_arg_index]=='lib':
         sysOps.globalmasterProcess.generate_uxi_library(sys.argv[start_arg_index+1])
-    elif sys.argv[start_arg_index]=='image':
+    elif sys.argv[start_arg_index]=='multiscale_gse':
         sysOps.globalmasterProcess.dnamic_inference(sys.argv[start_arg_index+1])
-    elif sys.argv[start_arg_index]=='gse':
+    elif sys.argv[start_arg_index]=='gse' or sys.argv[start_arg_index]=='cluster-raw':
         params = dict()
         arg_ind = start_arg_index+1
         while arg_ind < len(sys.argv):
@@ -43,8 +42,11 @@ if __name__ == '__main__':
             if arg_ind < len(sys.argv) and not sys.argv[arg_ind].startswith("-"):
                 params[sys.argv[arg_ind-1]].append(sys.argv[arg_ind])
                 arg_ind += 1
-                
-        optimOps.run_GSE(output_name = 'GSEoutput.txt',params=params)
+        
+        if sys.argv[start_arg_index]=='gse':
+            optimOps.run_GSE(output_name = 'GSEoutput.txt',params=params)
+        elif sys.argv[start_arg_index]=='cluster-raw':
+            optimOps.cluster_raw(output_name = 'CLUSTERoutput.txt',params=params)
     else:
         sysOps.throw_exception('Unrecognized pipeline input: ' + str(sys.argv))
 

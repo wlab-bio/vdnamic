@@ -10,187 +10,6 @@ import os
 import subprocess
 import re
 from numpy import linalg as LA
-
-def print_segmented_surface(sub_mle, Xumi_pos_filename, segment_outfilename, tiling_incr = 0.1, minumi_per_segment = 50):
-    # add point-wise probability densities
-    
-    density_window_rad = int(2.0/tiling_incr)
-    
-    final_Xumi = np.loadtxt(sysOps.globaldatapath + 'final_' + Xumi_pos_filename, delimiter = ',', dtype= np.float64)
-    final_Xumi = final_Xumi[:,1:]/tiling_incr
-    final_stats = np.loadtxt(sysOps.globaldatapath + segment_outfilename, delimiter = ',', dtype= np.float64)
-    final_sum_uei = np.int64(final_stats[:,1]) # will define spread of densities
-    final_segment = np.int64(final_stats[:,3]) # will define z-normalization
-    del final_stats
-    
-    final_min_X = np.int64(np.floor(np.min(final_Xumi,axis=0)))
-    final_max_X = np.int64(np.ceil(np.max(final_Xumi,axis=0)))
-    density_grid_sides = np.int64(final_max_X-final_min_X + 2*density_window_rad)
-    
-    # print underlying grid information
-    with open(sysOps.globaldatapath + 'grid_info_' + segment_outfilename,'w') as grid_info:
-        for d in range(sub_mle.spat_dims):
-            grid_info.write(','.join([str(x) for x in [float(final_min_X[d]-density_window_rad)*tiling_incr,
-                                                       float(final_max_X[d]+density_window_rad)*tiling_incr,
-                                                       tiling_incr]]) + '\n')
-    
-    density_grid = np.zeros(density_grid_sides, dtype=np.float64)
-    
-    # translate coordinates RELATIVE TO ORIGIN OF GRID (all coordinates now >0)
-    for d in range(sub_mle.spat_dims):
-        final_Xumi[:,d] += float(density_window_rad - final_min_X[d])
-    
-    # loop through segments individually, so that they can be internally normalized
-    argsort_seg_indices = np.argsort(final_segment)
-    seg_index_starts = np.append(np.append(0,1+np.where(np.diff(final_segment[argsort_seg_indices])>0)[0]),
-                                 final_segment.shape[0])
-    
-    added_density_side = density_window_rad*2 + 1 
-    added_density_meshgrid = np.meshgrid(np.arange(-density_window_rad,density_window_rad+1,dtype=np.float64),
-                                         np.arange(-density_window_rad,density_window_rad+1,dtype=np.float64))
-    added_density = np.zeros([added_density_side,added_density_side],dtype=np.float64)
-    radius_sq_array = np.zeros([added_density_side,added_density_side],dtype=np.float64)
-    for d in range(2):
-        added_density_meshgrid[d] *= tiling_incr # rescale
-        radius_sq_array += np.square(added_density_meshgrid[d])
-    bool_mask = (radius_sq_array <= radius_sq_array[density_window_rad,added_density_side-1]) # those elements corresponding to radii <= the half the axial width
-    
-    density_file = open(sysOps.globaldatapath + 'densities_' + segment_outfilename,'w')
-    for i in range(seg_index_starts.shape[0]-1):
-        start = seg_index_starts[i]
-        end = seg_index_starts[i+1]
-        if end-start >= minumi_per_segment:
-            my_segment_sum_uei = final_sum_uei[argsort_seg_indices[start:end]]
-            my_segment_Xumi = final_Xumi[argsort_seg_indices[start:end],:]
-            my_segment_str = str(final_segment[argsort_seg_indices[start]])
-                    
-            sum_uei_argsort = np.argsort(my_segment_sum_uei)
-            
-            prev_sigma_sq = 0
-            min_X_this_segment = density_grid_sides-1
-            max_X_this_segment = np.zeros(2,dtype=np.int64)
-            for n in sum_uei_argsort:
-                my_sigma_sq = 0.5/my_segment_sum_uei[n]
-                if my_sigma_sq != prev_sigma_sq:
-                    added_density[bool_mask] = np.power(my_sigma_sq,-0.5)*np.exp(-radius_sq_array[bool_mask]/
-                                                                                 (2.0*my_sigma_sq))
-                    prev_sigma_sq = float(my_sigma_sq)
-                ctr = np.round(my_segment_Xumi[n,:])
-                min_X = np.int64(np.maximum(ctr - density_window_rad,np.zeros(2)))
-                max_X = np.int64(np.minimum(ctr + density_window_rad,density_grid_sides-1))
-                min_X_added = np.int64(density_window_rad+min_X-ctr)
-                max_X_added = np.int64(density_window_rad+max_X-ctr)
-                density_grid[int(min_X[0]):int(max_X[0]),
-                             int(min_X[1]):int(max_X[1])] += added_density[int(min_X_added[0]):int(max_X_added[0]), 
-                                                                           int(min_X_added[1]):int(max_X_added[1])]
-                
-                min_X_this_segment = np.minimum(min_X_this_segment,min_X)
-                max_X_this_segment = np.maximum(max_X_this_segment,max_X)
-                
-            
-            density_grid[int(min_X_this_segment[0]):int(max_X_this_segment[0]),
-                         int(min_X_this_segment[1]):int(max_X_this_segment[1])] /= np.max(density_grid[int(min_X_this_segment[0]):int(max_X_this_segment[0]),
-                                                                                                       int(min_X_this_segment[1]):int(max_X_this_segment[1])])
-            
-            for x0 in range(min_X_this_segment[0],max_X_this_segment[0]):
-                for x1 in range(min_X_this_segment[1],max_X_this_segment[1]):
-                    if density_grid[x0,x1] > 1E-10:
-                        density_file.write(','.join([my_segment_str,
-                                                     str(tiling_incr*(x0+final_min_X[0]-density_window_rad)),
-                                                     str(tiling_incr*(x1+final_min_X[1]-density_window_rad)),
-                                                     str(density_grid[x0,x1])]) + '\n')
-            density_grid[int(min_X_this_segment[0]):int(max_X_this_segment[0]),int(min_X_this_segment[1]):int(max_X_this_segment[1])] = 0.0
-                         
-    density_file.close()
-
-def print_final_per_umi_stats(sub_mle, Xumi_pos_filename, segment_param = 0.5, Xumi_seg_filename=None, outfilename = 'umi_stats.csv'):
-    # print UEI count data with rows corresponding to output of final_* files
-    
-    [dirnames,filenames] = sysOps.get_directory_and_file_list()
-    seq_dat_filename = [filename for filename in filenames if filename.startswith('seq_params')]
-    seq_dat_filename = seq_dat_filename[0][len('seq_params_'):]
-    key_dat_file = 'key' + seq_dat_filename[(seq_dat_filename.find('_')):]
-  
-    if not sysOps.check_file_exists(key_dat_file):
-        sysOps.throw_exception(sysOps.globaldatapath + key_dat_file + ' does not exist.')
-        sysOps.exitProgram()
-    key_data = np.loadtxt(sysOps.globaldatapath + key_dat_file, delimiter = ',', dtype= np.int64)
-    key_bcn0trg1 = key_data[:,0]
-    orig_indices = key_data[:,1]
-    mle_indices = key_data[:,2]
-    # mle_indices have elements corresponding to the elements of sub_mle.index_key
-    # what we want now is 2 lookup arrays:  one for beacons indexed by orig_indices with elements being indices belonging to Xumi,
-    #                                       one for targets doing the same
-    bcn_new_index_lookup = -np.ones(np.max(orig_indices[key_bcn0trg1==0])+1,dtype=np.int64)
-    trg_new_index_lookup = -np.ones(np.max(orig_indices[key_bcn0trg1==1])+1,dtype=np.int64)
-    coords_lookup = -np.ones(np.max(mle_indices)+1,dtype=np.int64)
-    coords_lookup[sub_mle.index_key] = np.arange(sub_mle.Numi,dtype=np.int64) # elements of mle_indices and index_key are from the same indexing, here we assign elements to coords_dict which are the indices in uei_data
-    bcn_new_index_lookup[orig_indices[key_bcn0trg1==0]] = coords_lookup[mle_indices[key_bcn0trg1==0]]
-    trg_new_index_lookup[orig_indices[key_bcn0trg1==1]] = coords_lookup[mle_indices[key_bcn0trg1==1]]
-    
-    # load final position file
-    # 'final_' files have line-by-line correpondences with key files, and therefore the array mle_indices has elements corresponding to each line of the final file
-    final_Xumi = np.loadtxt(sysOps.globaldatapath + 'final_' + Xumi_pos_filename, 
-                            delimiter = ',', dtype= np.float64)
-    is_bcn = (np.loadtxt(sysOps.globaldatapath + 'final_feat_' + Xumi_pos_filename, 
-                         delimiter = ',', usecols = 1, dtype= np.int64)<0)
-    
-    # note bcn_new_index_lookup and trg_new_index_lookup will have negative entries in them, but these should not be covered by final output
-    # check this:
-    if np.sum(bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]<0)+np.sum(trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]<0) > 0:
-        sysOps.throw_exception('Error in generate_local_hessians(): final data-set covers unassigned MLE indices.')
-        sysOps.exitProgram()
-    if np.sum(is_bcn) != sub_mle.Nbcn or np.sum(~is_bcn) != sub_mle.Ntrg:
-        sysOps.throw_exception('Error in generate_local_hessians(): UMI count mismatch.')
-        sysOps.exitProgram()
-        
-    Xseg = np.zeros(sub_mle.Numi,dtype=np.int64)
-    if not(Xumi_seg_filename is None):
-        final_seg = np.int64(np.loadtxt(sysOps.globaldatapath + '..//infer_segment//final_' + Xumi_seg_filename,delimiter = ',', dtype= np.float64)[:,1])
-        sysOps.throw_status('Loading spectral segmentation file ' + '..//infer_segment//final_' + Xumi_seg_filename)
-        Xseg[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]] = final_seg[is_bcn]
-        Xseg[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]] = final_seg[~is_bcn]
- 
-    Xumi = np.zeros([sub_mle.Numi,sub_mle.spat_dims],dtype=np.float64)
-    
-    Xumi[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])],:] = final_Xumi[is_bcn,1:]
-    Xumi[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])],:] = final_Xumi[~is_bcn,1:]
-    
-    rms_uei_dist = np.zeros(sub_mle.Numi,dtype=np.float64)
-    threshold_assoc = np.zeros(sub_mle.Nassoc,dtype=np.bool_)
-    for i in range(sub_mle.Nassoc):
-        bcn_index = sub_mle.uei_data[i,0]
-        trg_index = sub_mle.uei_data[i,1]
-        sqdist = (LA.norm(np.subtract(Xumi[bcn_index,:],Xumi[trg_index,:])))**2.0
-        rms_uei_dist[bcn_index] += sub_mle.uei_data[i,2]*sqdist
-        rms_uei_dist[trg_index] += sub_mle.uei_data[i,2]*sqdist
-        bcn_sum_uei = float(sub_mle.sum_bcn_uei[bcn_index]+sub_mle.sum_trg_uei[bcn_index])
-        trg_sum_uei = float(sub_mle.sum_bcn_uei[trg_index]+sub_mle.sum_trg_uei[trg_index])
-        my_sigma_sq = 0.5*((1.0/bcn_sum_uei)+(1.0/trg_sum_uei))
-        my_weight = np.power(2.0*np.pi*my_sigma_sq,-0.5)*np.exp(-sqdist/(2.0*my_sigma_sq))
-        threshold_assoc[i] = (my_weight>=segment_param)
-    
-    sysOps.throw_status('Performing single-linkage clustering on kernel-matched segmentation data.')
-    index_link_array = np.arange(sub_mle.Numi,dtype=np.int64)
-    optimOps.min_contig_edges(index_link_array,Xseg,sub_mle.uei_data[threshold_assoc,:],np.sum(threshold_assoc))
-    rms_uei_dist = np.sqrt(np.divide(rms_uei_dist, np.float64(np.add(sub_mle.sum_bcn_uei,sub_mle.sum_trg_uei))))
-     
-    sysOps.throw_status('Generating final output for ' + sysOps.globaldatapath + outfilename)
-    final_counts = -np.ones([sub_mle.Numi,5],dtype=np.float64)
-    final_counts[is_bcn,0] = final_Xumi[is_bcn,0]
-    final_counts[is_bcn,1] = sub_mle.sum_bcn_uei[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]]
-    final_counts[is_bcn,2] = sub_mle.sum_bcn_assoc[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]]
-    final_counts[is_bcn,3] = index_link_array[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]]
-    final_counts[is_bcn,4] = rms_uei_dist[bcn_new_index_lookup[np.int64(final_Xumi[is_bcn,0])]]
-    final_counts[~is_bcn,0] = final_Xumi[~is_bcn,0]
-    final_counts[~is_bcn,1] = sub_mle.sum_trg_uei[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]]
-    final_counts[~is_bcn,2] = sub_mle.sum_trg_assoc[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]]
-    final_counts[~is_bcn,3] = index_link_array[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]]
-    final_counts[~is_bcn,4] = rms_uei_dist[trg_new_index_lookup[np.int64(final_Xumi[~is_bcn,0])]]
-    
-    np.savetxt(sysOps.globaldatapath + outfilename, final_counts,fmt='%i,%i,%i,%i,%.10e',delimiter=',')
-    
-    return Xumi
     
 def get_alignment_length(cigar):
     length = 0
@@ -227,7 +46,7 @@ def get_internal_mismatches(cigar, md, start):
 
     return mutation_string
     
-def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len,filter_umi0_quickmatch,filter_umi1_quickmatch,STARindexdir=None,gtffile=None,uei_matchfilepath=None):
+def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len,filter_umi0_quickmatch,filter_umi1_quickmatch,STARindexdir=None,gtffile=None,uei_matchfilepath=None,add_sequences_to_labelfiles=False):
     #function will tally reads counted for each umi
     
     # line_sorted_clust_* has columns
@@ -298,7 +117,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                         
                         if amp_len_list[amp_ind] is None or min_term_index >= amp_len_list[amp_ind]:
                             amp_trimmed.write(','.join([umi_index,myreads,seq[:min_term_index]]) + '\n')
-                            amp_trimmed_fasta.write('>' + umi_index + '.' + str(myreads) + '\n' + seq[:min_term_index] + '\n')
+                            amp_trimmed_fasta.write('>' + umi_index + '.' + str(myreads) + ':N:N\n' + seq[:min_term_index] + '\n')
                             if int(myreads)==1:
                                 clustcounts[0] += 1
                             elif int(myreads)==2:
@@ -323,17 +142,24 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
             # amp*_seqcons_trimmed.fasta
             # >umi index:reads \n amplicon sequence
         
-            if (match_str_list[amp_ind] is not None) and not sysOps.check_file_exists("amp" + str(amp_ind) + "_seqcons_matches.txt"):
-                match_strs = list()
-                with open(sysOps.globaldatapath + match_str_list[amp_ind],'r') as matchfile:
-                    str_ind = 0
-                    for match_str in matchfile:
-                        my_match_str = match_str.strip('\n')
-                        min_unambig = min([i for i in range(len(my_match_str)) if my_match_str[i]!='N'])
-                        match_strs.append("if(substr($3,"+str(min_unambig+1)+"," + str(len(my_match_str)-min_unambig) + ")== \"" + my_match_str[min_unambig:] + "\"){print ($1 \",\" $2 \",\" " + str(str_ind) + ");}")
-                        str_ind += 1
-                sysOps.throw_status('Performing quick-match on matches from ' + sysOps.globaldatapath + match_str_list[amp_ind] + '. Note: assignments will be ordered based on priority if quick-match inputs are ambiguous. Non-matches will be omitted')
-                sysOps.sh("awk -F, '{" + " else ".join(match_strs) + "}' " + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "  + sysOps.globaldatapath + "label_pt" + str(amp_ind) + ".txt")
+            if not sysOps.check_file_exists("amp" + str(amp_ind) + "_seqcons_matches.txt"):
+                if (match_str_list[amp_ind] is not None):
+                    match_strs = list()
+                    added_str = ""
+                    if add_sequences_to_labelfiles:
+                        added_str = " \",\" $3"
+                    with open(sysOps.globaldatapath + match_str_list[amp_ind],'r') as matchfile:
+                        str_ind = 0
+                        for match_str in matchfile:
+                            my_match_str = match_str.strip('\n')
+                            min_unambig = min([i for i in range(len(my_match_str)) if my_match_str[i]!='N'])
+                            match_strs.append("if(substr($3,"+str(min_unambig+1)+"," + str(len(my_match_str)-min_unambig) + ")== \"" + my_match_str[min_unambig:] + "\"){print ($1 \",\" $2 \",\" " + str(str_ind) + added_str + ");}")
+                            str_ind += 1
+                        
+                    sysOps.throw_status('Performing quick-match on matches from ' + sysOps.globaldatapath + match_str_list[amp_ind] + '. Note: assignments will be ordered based on priority if quick-match inputs are ambiguous. Non-matches will be omitted')
+                    sysOps.sh("awk -F, '{" + " else ".join(match_strs) + " else{print ($1 \",\" $2 \",-1\" " + added_str + ");}}' " + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "  + sysOps.globaldatapath + "label_pt" + str(amp_ind) + ".txt")
+                elif add_sequences_to_labelfiles:
+                    sysOps.sh("awk -F, '{print ($1 \",\" $2 \",-1,\" $3);}' " + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "  + sysOps.globaldatapath + "label_pt" + str(amp_ind) + ".txt")
             
             if type(STARindexdir)==str and type(gtffile) == str and not sysOps.check_file_exists("sorted_umi_seq_assignments" +str(amp_ind) + ".txt"):
                 if not sysOps.check_file_exists(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam"):
@@ -348,8 +174,8 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # convert alignment file to csv
 
                 if not sysOps.check_file_exists("STARalignment" +str(amp_ind) + "/sorted_Aligned.out.sam.txt"):
-                    sysOps.sh("awk -F\"\t\" '{if(substr($1,1,1)!=\"@\"){query_name = $1; src_contig = $3; start=$4; cigar_str = $6; query_len = length($10); md = $12;                                                                              nM = 0; for(i=12; i<=NF; i++) {if($i ~ /^nM:i:/) {split($i, arr, \":\"); nM = arr[3]; break; }} split(cigar_str, a, /[MIDNSHP=X]/); len = 0;  for(i=1; i<= length(a); i++) { if(a[i] ~ /^[0-9]+$/){len += a[i];} } if(len > 0){ mymatch_num = len - (2*nM);} else{mymatch_num = 0;} if(mymatch_num>0){print \"UMI,\" src_contig \",\" query_name \",\" start \",\" md \",\" cigar_str \",\" mymatch_num;}}}' " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt")
-                    # awk-script assigns mymatch_num as matches minus mismatches
+                    sysOps.sh("awk -F\"\t\" '{if(substr($1,1,1)!=\"@\"){query_name = $1; src_contig = $3; start=$4; cigar_str = $6; query_len = length($10); md = $12;                                                                              nM = 0; for(i=12; i<=NF; i++) {if($i ~ /^nM:i:/) {split($i, arr, \":\"); nM = arr[3]; break; }} split(cigar_str, a, /[MIDNSHP=X]/); len = 0;  for(i=1; i<= length(a); i++) { if(a[i] ~ /^[0-9]+$/){len += a[i];} } if(len > 0){ mymatch_pct = 1 - (nM / len);} else{mymatch_pct = 0;} if(mymatch_pct>0){print \"UMI,\" src_contig \",\" query_name \",\" start \",\" md \",\" cigar_str \",\" mymatch_pct;}}}' " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt")
+                    
                     # Aligned.out.sam.txt now has columns:
                     # 1. "UMI"
                     # 2. src_contig
@@ -357,7 +183,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                     # 4. start
                     # 5. md
                     # 6. cigar_str
-                    # 7. match num
+                    # 7. match percentage
                     
                     sysOps.big_sort(" -k3,3 -k7rn,7 -t \",\" ", "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt", "STARalignment" +str(amp_ind) + "/tmp_sorted_Aligned.out.sam.txt")
                     # retain only top matches
@@ -373,7 +199,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                     # 4. start (num-sort)
                     # 5. md
                     # 6. cigar_str
-                    # 7. match num
+                    # 7. match percentage
                     
                 if not sysOps.check_file_exists("STARalignment" +str(amp_ind) + "/sorted_gtf.txt"):
                     sysOps.sh("awk -F\" \" '{gsub(/\\\"|\;/,\"\"); src_contig = $1; feature=$3; start=$4; end=$5; gene_biotype=\"NONE\"; gene_name=\"NONE\"; transcript_name=\"NONE\"; gene_id=\"NONE\"; transcript_biotype=\"NONE\"; for(i=1;i<=NF-1;i++){"
@@ -397,6 +223,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                     # 8. gene_id
                     # 9. transcript_name
                     # 10. transcript_biotype
+                    
                     sysOps.big_sort(" -k2,2 -k4n,4 -t \",\" ", "STARalignment" +str(amp_ind) + "/gtf.txt", "STARalignment" +str(amp_ind) + "/sorted_gtf.txt")
                     os.remove(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/gtf.txt")
                     
@@ -413,17 +240,12 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                             line_str = align_gtf_line.strip('\n')
                             if line_str.startswith('UMI'):
                                 line_str = line_str.split(',')
-                                [umi_index,read_num] = line_str[2].split('.')
+                                [umi_index,read_num] = line_str[2].split(':')[0].split('.')
                                 if len(current_tags)>0: # input data
                                     # reconcile mappings
                                     mappings = list([list([str(current_tags[0][j])]) for j in range(len(current_tags[0]))])
                                     for i in range(1,len(current_tags)):
-                                        for j in range(len(mappings)):
-                                            if j >= len(current_tags[i]):
-                                                sysOps.throw_status('Formatting error: field-number mismatch.')
-                                                sysOps.throw_status('mappings = ' + str(mappings))
-                                                sysOps.throw_status('current_tags[i] = ' + str(current_tags[i]))
-                                                sysOps.exitProgram()
+                                        for j in range(len(current_tags[i])):
                                             mappings[j].append(str(current_tags[i][j]))
                                                                 
                                     for j in range(len(mappings)):
@@ -452,7 +274,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                                 # 7. transcript name
                                 # 8. read num
                                 # 9. attention rank: (rRNA=1,other/numerical contig=2,other/random contig=3,genome/NA=4)
-                            elif not line_str.startswith('UMI'):
+                            elif not line_str.startswith('UMI'): # is a GTF feature
                                 line_str = line_str.split(',')
                                 if line_str[0] in current_flags:
                                     rm_index = current_flags.index(line_str[0])
@@ -529,7 +351,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # 2. unique sequence index
                 # 3. cluster_ind (LEX SORT)
                 
-                sysOps.sh("join -t \",\" -1 3 -2 1 -o1.1,1.2,2.2,2.3,2.4,2.5,2.6,2.7,2.8 " + sysOps.globaldatapath + "clust_sort_clust_uxi" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "umi_assignments" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
+                sysOps.sh("join -t \",\" -1 3 -2 1 -o1.1,1.2,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.1 " + sysOps.globaldatapath + "clust_sort_clust_uxi" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "umi_assignments" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
                 # umi_seq_assignments* has columns:
                 # 1. umi sequence
                 # 2. unique sequence index
@@ -540,7 +362,18 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # 7. gene biotype/s
                 # 8. transcript name/s
                 # 9. number of reads
+                # 10. query-name (UMI only)
                 
+                if add_sequences_to_labelfiles:
+                    sysOps.throw_status('Adding raw sequences to alignment output ' + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
+                    os.rename(sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt", sysOps.globaldatapath + "tmp_umi_seq_assignments" +str(amp_ind) + ".txt")
+                    sysOps.big_sort(" -k10,10 -t \",\" ","tmp_umi_seq_assignments" +str(amp_ind) + ".txt", "tmp_sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
+                    sysOps.big_sort(" -k1,1 -t \",\" ","amp" +str(amp_ind) + "_seqcons_trimmed.txt", "tmp_sorted_amp" +str(amp_ind) + "_seqcons_trimmed.txt")
+                    sysOps.sh("join -t \",\" -1 10 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.3 " + sysOps.globaldatapath + "tmp_sorted_umi_seq_assignments" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "tmp_sorted_amp" +str(amp_ind) + "_seqcons_trimmed.txt > " + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
+                    sysOps.throw_status('Done.')
+               
+                sysOps.sh("rm " + sysOps.globaldatapath + "tmp*seq*")
+                    
                 # sort by umi sequence
                 sysOps.big_sort(" -k1,1 -t \",\" ","umi_seq_assignments" +str(amp_ind) + ".txt", "sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
                 # sorted_umi_seq_assignments* has columns
@@ -553,6 +386,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # 7. gene biotype/s
                 # 8. transcript name/s
                 # 9. number of reads
+                # 10. cDNA UMI index *or* query sequence if add_sequences_to_labelfiles = TRUE
                 
             else:
                 sysOps.throw_status('No genome directory provided, skipping alignment.')
@@ -578,11 +412,11 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # 3. cluster_ind
                 sysOps.big_sort(" -k1,1 -t \",\" ", "tmp_UEIdata_uxi" +str(amp_ind) + ".txt", "UEIdata_uxi" +str(amp_ind) + ".txt")
         
-                sysOps.sh("join -t ',' -1 1 -2 1 -o2.3,1.3,1.4,1.5,1.6,1.7,1.8,1.9 " + sysOps.globaldatapath + "sorted_umi_seq_assignments" + str(amp_ind) + ".txt " + sysOps.globaldatapath + "UEIdata_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "unsorted_label_pt" +str(amp_ind) + ".txt")
+                sysOps.sh("join -t ',' -1 1 -2 1 -o2.3,1.3,1.4,1.5,1.6,1.7,1.8,1.9,1.10 " + sysOps.globaldatapath + "sorted_umi_seq_assignments" + str(amp_ind) + ".txt " + sysOps.globaldatapath + "UEIdata_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "unsorted_label_pt" +str(amp_ind) + ".txt")
             
-                # final_umi_assignments* has columns
+                # unsorted_label_pt* has columns
                 # 1. UEI-dataset cluster index
-                # 2-8. UMI assignments
+                # 2-9. UMI assignments
                 
                 # sort by UEI-data set cluster indexa
                 sysOps.big_sort(" -k1,1 -t \",\" ", "unsorted_label_pt" +str(amp_ind) + ".txt", "tmp_label_pt" +str(amp_ind) + ".txt")
@@ -593,10 +427,13 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 os.remove(sysOps.globaldatapath + "sorted_UEIdata_uxi" +str(amp_ind) + ".txt")
                 os.remove(sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt")
                 os.remove(sysOps.globaldatapath + "UEIdata_uxi" +str(amp_ind) + ".txt")
-    try:
-        sysOps.sh("rm -r " + sysOps.globaldatapath + "STARalignment*")
-    except:
-        pass
+    
+    for amp_ind in range(2):
+        if sysOps.check_file_exists("STARalignment" + str(amp_ind) + "/Aligned.out.sam"):
+            if True: #run_velocyto:
+                os.rename(sysOps.globaldatapath + "STARalignment" + str(amp_ind) + "/Aligned.out.sam",sysOps.globaldatapath + "Aligned" + str(amp_ind) + ".out.sam")
+            sysOps.sh("rm -r " + sysOps.globaldatapath + "STARalignment" + str(amp_ind) + "/")
+    
     return
             
     
@@ -663,11 +500,11 @@ def assign_umi_pairs(uei_ind):
 
     return
 
-def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_per_uei,uei_classification=None):
+def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_uei_per_assoc, uei_classification=None):
     # all inputs are lists having length equal to the number of UEI types
     # concatenate all consensus pairings files
     
-    sysOps.throw_status('Outputting inference input-files with the following parameters: min_reads_per_assoc=' + str(min_reads_per_assoc) + ', min_uei_per_umi=' + str(min_uei_per_umi) + ', min_reads_per_uei=' + str(min_reads_per_uei))
+    sysOps.throw_status('Outputting inference input-files with the following parameters: min_reads_per_assoc=' + str(min_reads_per_assoc) + ', min_uei_per_umi=' + str(min_uei_per_umi) + ', min_uei_per_assoc=' + str(min_uei_per_assoc))
     
     if not sysOps.check_file_exists("uei_assoc.txt"):
         if sysOps.check_file_exists("all_consensus_pairings.txt"):
@@ -713,15 +550,13 @@ def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_p
             os.remove(sysOps.globaldatapath + "tmp_sorted_uxi" + str(uxi_ind) + ".txt")
         
                 
-        # min_reads_per_uei and min_uei_per_umi, although taken as lists in the settings file, are only used for their first element
+        # min_uei_per_assoc and min_uei_per_umi, although taken as lists in the settings file, are only used for their first element
         conditional_assoc_str = "(my_ueinum>="+str(min_uei_per_umi)+")"
         
         #perform iterative filter using the other 3 function-input filters
         # sort LEXICOGRAPHICALLY by all association triples (note UMI2 is first sort argument)
             
-        sysOps.sh("awk -F, '{if($1 >= " + str(min_reads_per_uei) + "){print $1 \",\" $2 \",\" $3 \",\" $4 \",\" $5 \",\" $6}}' " + sysOps.globaldatapath + "all_consensus_pairings.txt > " + sysOps.globaldatapath + "filt_cons_pairings.txt")
-        sysOps.big_sort(" -k4,4 -k3,3 -t ',' ","filt_cons_pairings.txt","tmp_sorted_all.txt")
-        os.remove(sysOps.globaldatapath + "filt_cons_pairings.txt")
+        sysOps.big_sort(" -k4,4 -k3,3 -t ',' ","all_consensus_pairings.txt","tmp_sorted_all.txt")
                 
         # tmp_sorted_all.txt
         # all_consensus_pairings.txt contains columns:
@@ -747,22 +582,16 @@ def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_p
         num_assoc = -1
         filter_iter = 0
         while True:
-        
             sysOps.big_sort(" -k1,1 -t ',' ","sorted_assoc.txt","resorted_assoc.txt") # sort lex
+            
             os.remove(sysOps.globaldatapath + "sorted_assoc.txt")
             if filter_iter > 0 and num_assoc == num_assoc_init:
             
                 # at this point, consolidate read-formats based on UEI-classification; if no uei_classification=None, set all classification indices to 0
-                if uei_classification is None:
-                    uei_class_condition_str = "my_ueicount1++;"
-                else:
-                    uei_class_condition_str = "if("
-                    uei_class_condition_str += ' || '.join(["($6+0 == " + str(uei_classification[i][0]) + "+0 && $7+0 == " + str(uei_classification[i][1]) + "+0)" for i in range(len(uei_classification))])
-                    uei_class_condition_str += "){my_ueicount1+=1;}else{my_ueicount2+=1;}"
                 # consolidate UEIs into associations
-                sysOps.sh("awk -F, 'BEGIN{prev_col1=-1;prev_col3=-1;prev_col4=-1;prev_col5=-1;my_ueicount1=0;my_ueicount2=0;}"
-                          + "{if(prev_col1!=$1){if(prev_col1>=0){print (prev_col3 \",\" prev_col4 \",\" prev_col5 \",\" my_ueicount1 \",\" my_ueicount2);} my_ueicount1=0;my_ueicount2=0;}prev_col1=$1;prev_col3=$3;prev_col4=$4;prev_col5=$5;" + uei_class_condition_str + "}"
-                          + "END{print (prev_col3 \",\" prev_col4 \",\" prev_col5 \",\" my_ueicount1 \",\" my_ueicount2);}' "
+                sysOps.sh("awk -F, 'BEGIN{prev_col1=-1;prev_col3=-1;prev_col4=-1;prev_col5=-1;my_ueicount1=0;my_readcount=0;}"
+                          + "{if(prev_col1!=$1){if(prev_col1>=0){print (prev_col3 \",\" prev_col4 \",\" prev_col5 \",\" my_ueicount1 \",\" my_readcount);} my_ueicount1=0;my_readcount=0;}prev_col1=$1;my_readcount+=$2;prev_col3=$3;prev_col4=$4;prev_col5=$5;my_ueicount1++;}"
+                          + "END{print (prev_col3 \",\" prev_col4 \",\" prev_col5 \",\" my_ueicount1 \",\" my_readcount);}' "
                           + sysOps.globaldatapath + "resorted_assoc.txt > "
                           + sysOps.globaldatapath + "uei_assoc.txt")
                 os.remove(sysOps.globaldatapath + "resorted_assoc.txt")
@@ -771,11 +600,11 @@ def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_p
             num_assoc_init = int(sysOps.sh("wc -l < " + sysOps.globaldatapath + "resorted_assoc.txt").strip('\n'))
             
             # generate list of all associations passing filter
-            sysOps.sh("awk -F, 'BEGIN{prev_col1=-1;my_readnum=0;}"
-                      + "{if(prev_col1==$1){my_readnum+=$2;}"
-                      + "else{if(my_readnum>=" + str(min_reads_per_assoc) + "){print prev_col1;}"
-                      + "my_readnum=$2;prev_col1=$1;}}"
-                      + "END{if(my_readnum>=" + str(min_reads_per_assoc) + "){print prev_col1;}}' "
+            sysOps.sh("awk -F, 'BEGIN{prev_col1=-1;my_readnum=0;my_ueinum=0;}"
+                      + "{if(prev_col1==$1){my_readnum+=$2;my_ueinum+=1;}"
+                      + "else{if(my_readnum>=" + str(min_reads_per_assoc) + " && my_ueinum>=" +str(min_uei_per_assoc)+ "){print prev_col1;}"
+                      + "my_readnum=$2;prev_col1=$1;my_ueinum=1;}}"
+                      + "END{if(my_readnum>=" + str(min_reads_per_assoc) + " && my_ueinum>=" +str(min_uei_per_assoc)+"){print prev_col1;}}' "
                       + sysOps.globaldatapath + "resorted_assoc.txt > "
                       + sysOps.globaldatapath + "passed_assoc.txt")
                     
@@ -805,6 +634,7 @@ def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_p
             sysOps.sh("join -t ',' -1 4 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7 "
                       + sysOps.globaldatapath + "resorted_assoc.txt " + sysOps.globaldatapath + "passed_assoc.txt > "
                       + sysOps.globaldatapath + "sorted_assoc.txt")
+                      
             num_assoc = int(sysOps.sh("wc -l < " + sysOps.globaldatapath + "sorted_assoc.txt").strip('\n'))
             if num_assoc == 0:
                 sysOps.throw_status("No UMIs passed filter.")
@@ -838,6 +668,7 @@ def output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_p
     # 1. UEI type
     # 2-3. UMI cluster pairings
     # 4. number of UEIs for this association
+    # 5. number of reads
     
     sl_clust_assoc("uei_assoc.txt",filter_if_umis_labeled=True) # final clustering (NO FURTHER FILTERING OF ASSOCIATIONS)
     return    
