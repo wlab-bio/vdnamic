@@ -9,27 +9,33 @@ from scipy import misc
 import fileOps
 from numpy import linalg as LA
 from scipy.sparse.linalg import lobpcg, LinearOperator, ArpackNoConvergence
-from scipy.sparse import csc_matrix, save_npz, load_npz
+from scipy.sparse import csc_matrix, csr_matrix, save_npz, load_npz
 from scipy.optimize import minimize
 from scipy import cluster
+import osqp
+import sknetwork
+from scipy.sparse import vstack, eye
 import sklearn
 from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import pairwise_distances
+from sklearn.manifold import MDS
 from numpy import random
 import random
 from numpy.random import rand
 from importlib import import_module
 from numba import jit, njit, types
 import os
+import faiss
+import igraph, leidenalg
 os.environ["OPENBLAS_NUM_THREADS"] = "2"
 import time
 import subprocess
 import shutil
 import multiprocessing as mp
-from multiprocessing import Process
-from multiprocessing import shared_memory
-from multiprocessing import active_children
+from multiprocessing import Process, shared_memory, active_children, Pool, cpu_count
+import gc
 
-def print_final_results(final_coordsfile,spat_dims):
+def print_final_results(final_coordsfile,spat_dims,label_dir = "",intermed_indexing_directory=None):
     
     # split index key between pt types
     # index_key.txt has columns:
@@ -45,9 +51,30 @@ def print_final_results(final_coordsfile,spat_dims):
     # 1. pt GSE index (consecutive from 0)
     # 2-. Coordinates
     
+    sysOps.throw_status("Printing final image inference results ...")
     
-    sysOps.sh("awk -F, '{print $1 \",\" $2 \",\" $3 > (\"" +  sysOps.globaldatapath + "index_key_" "\" $1 \".txt\")}' " +
-               sysOps.globaldatapath + "index_key.txt")
+    if intermed_indexing_directory is None:
+        sysOps.throw_status("No intermediate indexing directory provided.")
+        sysOps.sh("cp " + sysOps.globaldatapath + "index_key.txt " + sysOps.globaldatapath + "final_index_key.txt")
+    else:
+        new_index_key = np.loadtxt(sysOps.globaldatapath + "index_key.txt",delimiter=',',dtype=np.int32)[:,1]
+        old_index_key = np.loadtxt(sysOps.globaldatapath + intermed_indexing_directory + "index_key.txt",delimiter=',',dtype=np.int32)
+        if np.sum(old_index_key[:,2] == np.arange(old_index_key.shape[0])) != old_index_key.shape[0]:
+            sysOps.throw_status("Error in consecutive order of column 3 for file " + sysOps.globaldatapath + intermed_indexing_directory + "index_key.txt")
+            sysOps.exitProgram()
+        old_index_key = old_index_key[new_index_key,:]
+        old_index_key[:,2] = np.arange(new_index_key.shape[0])
+        sysOps.throw_status("Applying intermediate indexing directory " + sysOps.globaldatapath + intermed_indexing_directory)
+        np.savetxt(sysOps.globaldatapath + "final_index_key.txt", old_index_key,delimiter=',',fmt='%i')
+        del new_index_key, old_index_key
+    
+    sysOps.sh("awk -F, '{print $1 \",\" $2 \",\" $3 > (\"" +  sysOps.globaldatapath + "index_key_" "\" $1 \".txt\")}' " + sysOps.globaldatapath + "final_index_key.txt")
+    os.remove(sysOps.globaldatapath + "final_index_key.txt")
+                   
+    # index_key*.txt has columns:
+    # 1. pt type (0 or 1 exclusively)
+    # 2. pt raw-data index
+    # 3. pt GSE index (consecutive from 0)
     
     if sysOps.check_file_exists("label_reindexed.txt"):
         os.remove(sysOps.globaldatapath + "label_reindexed.txt")
@@ -55,22 +82,30 @@ def print_final_results(final_coordsfile,spat_dims):
     max_attr_fields = 0
     pt_ind = 0
     while sysOps.check_file_exists("index_key_" + str(pt_ind) + ".txt"): # get largest number of attributes to pad columns
-        if sysOps.check_file_exists("..//label_pt" + str(pt_ind) + ".txt"):
-            max_attr_fields = max(max_attr_fields,int(sysOps.sh("head -1 " + sysOps.globaldatapath + "..//label_pt" + str(pt_ind) + ".txt").strip('\n').count(',')))
+        if sysOps.check_file_exists(label_dir + "label_pt" + str(pt_ind) + ".txt"):
+            max_attr_fields = max(max_attr_fields,int(sysOps.sh("head -1 " + sysOps.globaldatapath + label_dir + "label_pt" + str(pt_ind) + ".txt").strip('\n').count(',')))
+        sysOps.big_sort(" -t \",\" -k2,2 ","index_key_" + str(pt_ind) + ".txt","tmp_index_key_" + str(pt_ind) + ".txt")
+        os.rename(sysOps.globaldatapath + "tmp_index_key_" + str(pt_ind) + ".txt",sysOps.globaldatapath + "index_key_" + str(pt_ind) + ".txt") # replace with lexicographic sort
         pt_ind += 1
+
             
     pt_ind = 0
     while sysOps.check_file_exists("index_key_" + str(pt_ind) + ".txt"):
         attr_fields = 0
-        if sysOps.check_file_exists("..//label_pt" + str(pt_ind) + ".txt"):
+        if sysOps.check_file_exists(label_dir + "label_pt" + str(pt_ind) + ".txt"):
             # get number of attribute fields
-            attr_fields = int(sysOps.sh("head -1 " + sysOps.globaldatapath + "..//label_pt" + str(pt_ind) + ".txt").strip('\n').count(','))
+            attr_fields = int(sysOps.sh("head -1 " + sysOps.globaldatapath + label_dir + "label_pt" + str(pt_ind) + ".txt").strip('\n').count(','))
             
         if attr_fields > 0:
             
             # join by lex sorted raw-data index
-            sysOps.throw_status("Found label_pt" + str(pt_ind) + ".txt with " + str(attr_fields) + " attribute fields.")
-            sysOps.big_sort(" -t \",\" -k1,1 ","../label_pt" + str(pt_ind) + ".txt","sorted_label_pt" + str(pt_ind) + ".txt") # lex sort
+            sysOps.throw_status("Found " + sysOps.globaldatapath + label_dir + "label_pt" + str(pt_ind) + ".txt with " + str(attr_fields) + " attribute fields.")
+            sysOps.big_sort(" -t \",\" -k1,1 ",label_dir + "label_pt" + str(pt_ind) + ".txt","sorted_label_pt" + str(pt_ind) + ".txt") # lex sort
+                
+            # sorted_label_pt*.txt has columns
+            # 1. pt raw-data index (sorted lexicographically)
+            # 2-. Other attributes
+            
             sysOps.sh("join -t ',' -eN -1 2 -2 1 -o1.1,1.2,1.3," + ",".join(["2." + str(attr+2) for attr in range(attr_fields)]) + " "
                       + sysOps.globaldatapath + "index_key_" + str(pt_ind) + ".txt "
                       + sysOps.globaldatapath + "sorted_label_pt" + str(pt_ind) + ".txt > "
@@ -81,7 +116,7 @@ def print_final_results(final_coordsfile,spat_dims):
             # 2. pt raw-data index (sorted lexicographically individually by pt type 0 and 1)
             # 3. pt GSE index (consecutive from 0)
             # 4-. attributes
-            # empty fields in the above have been filled in with "N", but note that we do not want to include pts absent in index_key (only those absent in lael readouts in case positions are of interest)
+            # empty fields in the above have been filled in with "N", but note that we do not want to include pts absent in index_key (only those absent in label readouts in case positions are of interest)
             sysOps.sh("awk -F, '{if($1!=\"N\"){print $1 \",\"  $2 \",\" $3 \",\" " + " \",\" ".join([(" $"+str(attr+4) + " ") for attr in range(attr_fields)]) + "}}' " + sysOps.globaldatapath + "tmp_label_reindexed.txt > " + sysOps.globaldatapath + "label_reindexed_" + str(pt_ind) + ".txt")
             os.remove(sysOps.globaldatapath + "tmp_label_reindexed.txt")
             
@@ -89,7 +124,7 @@ def print_final_results(final_coordsfile,spat_dims):
             sysOps.throw_status("No label_pt" + str(pt_ind) + ".txt.")
             sysOps.sh("awk -F, '{print $1 \",\" $2 \",\" $3 " + "".join([" \",-1\" "]*max_attr_fields) + "}' " + sysOps.globaldatapath + "index_key_" + str(pt_ind) + ".txt > " + sysOps.globaldatapath + "label_reindexed_" + str(pt_ind) + ".txt")
         
-        os.remove(sysOps.globaldatapath + "index_key_" + str(pt_ind) + ".txt")
+        #os.remove(sysOps.globaldatapath + "index_key_" + str(pt_ind) + ".txt")
         
         pt_ind += 1
             
@@ -97,41 +132,36 @@ def print_final_results(final_coordsfile,spat_dims):
     #sysOps.sh("rm " + sysOps.globaldatapath + "label_reindexed_*.txt")
     sysOps.big_sort(" -t \",\" -k3,3 ","label_reindexed.txt","tmp_label_reindexed.txt")
     os.rename(sysOps.globaldatapath + "tmp_label_reindexed.txt",sysOps.globaldatapath + "label_reindexed.txt")
-        
-    # if cluster assignments exist, append to coords file
-    num_coord_fields = int(spat_dims)
-    if sysOps.check_file_exists('clust_assignments.txt'):
-        num_coord_fields += int(sysOps.sh("head -1 " + sysOps.globaldatapath + "clust_assignments.txt").strip('\n').count(','))+1
-        sysOps.sh("paste -d, " + sysOps.globaldatapath + final_coordsfile + " " + sysOps.globaldatapath + "clust_assignments.txt > " + sysOps.globaldatapath + "tmp_" + final_coordsfile)
-        os.rename(sysOps.globaldatapath + "tmp_" + final_coordsfile,sysOps.globaldatapath + final_coordsfile)
-    
-    sysOps.big_sort(" -t \",\" -k1,1 ", final_coordsfile,"tmp_" + final_coordsfile)
-    
-    os.rename(sysOps.globaldatapath + "tmp_" + final_coordsfile, sysOps.globaldatapath +  "resorted_" + final_coordsfile)
-        
-    # label_reindexed.txt:
-    # 1. pt type (0 or 1)
+    # label_reindexed.txt has columns:
+    # 1. pt type
     # 2. pt raw-data index
     # 3. pt GSE index (sorted lexicographically)
     # 4-. attributes
+        
+    # if cluster assignments exist, append to coords file
+    num_coord_fields = int(spat_dims)
+    if sysOps.check_file_exists('clust_assignments.npy') and not sysOps.check_file_exists('clust_assignments.txt'):
+        clust_assignments = np.load(sysOps.globaldatapath + 'clust_assignments.npy')
+        num_coord_fields += clust_assignments.shape[1]
+        np.savetxt(sysOps.globaldatapath + 'clust_assignments.txt',clust_assignments,delimiter=',',fmt='%i')
+        os.rename(sysOps.globaldatapath + final_coordsfile,sysOps.globaldatapath + "tmp_" + final_coordsfile)
+        sysOps.sh("paste -d, " + sysOps.globaldatapath + "tmp_" + final_coordsfile + " " + sysOps.globaldatapath + "clust_assignments.txt > " + sysOps.globaldatapath + final_coordsfile)
+        os.remove(sysOps.globaldatapath + "tmp_" + final_coordsfile)
+        
+    sysOps.big_sort(" -t \",\" -k1,1 ", final_coordsfile,"tmp_" + final_coordsfile)
     
+    os.rename(sysOps.globaldatapath + "tmp_" + final_coordsfile, sysOps.globaldatapath +  "resorted_" + final_coordsfile)
     # Updated files:
-    # final_coordsfile has columns:
+    # resorted_final_coordsfile has columns:
     # 1. pt GSE index (sorted lexicographially)
-    
-    # final_labels.txt now has columns
-    # 1. pt type (0 or 1)
-    # 2. raw data index
-    # 3. pt GSE index (sorted lexicographically)
-    # 4-. labels
-    
-    # final_coords.txt now has columns
-    # 1-. Coordinates
+    # 2-. coords
     
     num_label_fields = int(sysOps.sh("head -1 " + sysOps.globaldatapath + "label_reindexed.txt").strip('\n').count(','))-2
-    sysOps.sh("join -t ',' -1 3 -2 1 -o1.1,1.2" + ''.join([',1.' + str(i+3) for i in range(1,num_label_fields+1)]) + ''.join([',2.' + str(i+1) for i in range(1,num_coord_fields+1)]) + " "
-              + sysOps.globaldatapath + "label_reindexed.txt "
-              + sysOps.globaldatapath + "resorted_" + final_coordsfile + " > " + sysOps.globaldatapath + "final.txt")
+    sysOps.sh("join -t ',' -1 3 -2 1 -o1.1,1.2" + ''.join([',1.' + str(i+3) for i in range(1,num_label_fields+1)]) + ''.join([',2.' + str(i+1) for i in range(1,num_coord_fields+1)]) + " " + sysOps.globaldatapath + "label_reindexed.txt " + sysOps.globaldatapath + "resorted_" + final_coordsfile + " > " + sysOps.globaldatapath + "final.txt")
+    # final.txt:
+    # 1. pt type (0 or 1)
+    # 2. pt raw-data index
+    # 3-. coords
         
     os.remove(sysOps.globaldatapath + "resorted_" + final_coordsfile)
     # sort
@@ -143,63 +173,105 @@ def print_final_results(final_coordsfile,spat_dims):
     sysOps.sh("awk -F, '{print (" + " \",\" ".join(["$"+str(i) for i in range(1,num_label_fields+3)]) + ") > (\"" +  sysOps.globaldatapath +  "final_labels.txt\"); print (" + " \",\"  ".join(["$"+str(i) for i in range(num_label_fields+3,num_label_fields+num_coord_fields+3)]) + ") > (\"" +  sysOps.globaldatapath + "final_coords.txt\");}' " + sysOps.globaldatapath + "sorted_final.txt")
     os.remove(sysOps.globaldatapath + "sorted_final.txt")
 
+    # final_labels.txt now has columns
+    # 1. pt type (0 or 1)
+    # 2. raw data index (sorted numerically)
+    # 3-. labels
+    
+    # final_coords.txt now has columns
+    # 1-. Coordinates
+    
+    #sysOps.sh("rm " + sysOps.globaldatapath + "label* " + sysOps.globaldatapath + "sorted_label*")
     return
-
-
-
-@njit("int64(int64[:],float64[:],int64[:],int64[:],float64[:,:],int64,int64,int64)",fastmath=True)
-def farthest_pt(ctr_assignments,pt_ctr_dists,ctr_pt_indices,ctr_memberships,coords,num_pts,max_membership_threshold,rand_seed_index):
-    # perform farthest point algorithm
-    # space has size (num_pts, num_dims)
-    # ctr_pt_indices have size (num_pts,)
-    # sqdists and ctr_assignments has size (num_pts, ref_pts)
     
-    # minimize maximum value of |(any unit vector in tot_dims space) . (any point vector belonging to sector directed from sector center outside of max_loc_dims space)|/sum(numerator across all points in sector)
-    
-    my_max_dist = -1.0
-    pt_ctr_dists[:] = -1.0
-    ctr_assignments[:] = -1
-    ctr_memberships[:] = 0
-    ctr_pt_indices[:] = -1
-    k_ctrs = 0
-    my_seed = int(rand_seed_index)
-    max_ctrs = int(np.sqrt(num_pts)*2.0) # keep loop from run-away expansion of center-set
-    
-    while k_ctrs <= max_ctrs:
-        
-        ctr_pt_indices[k_ctrs] = my_seed
-        my_max_dist = 0.0
-        
-        for n in range(num_pts):
-            mynorm = LA.norm(coords[n,:] - coords[my_seed,:])
-            
-            # compare to largest distance to see if need to replace
-            if pt_ctr_dists[n] < 0 or mynorm < pt_ctr_dists[n]:
-                pt_ctr_dists[n] = float(mynorm)
-                if ctr_assignments[n] >= 0:
-                    ctr_memberships[ctr_assignments[n]] -= 1
-                ctr_assignments[n] = int(k_ctrs)
-                ctr_memberships[k_ctrs] += 1
-        
-        k_ctrs += 1
-        if np.max(ctr_memberships[:k_ctrs]) < max_membership_threshold:
-            break
-            
-        my_max_dist = 0.0
-        my_seed = -1
-        for n in range(num_pts):
-            if ctr_memberships[ctr_assignments[n]] > max_membership_threshold  and pt_ctr_dists[n] > my_max_dist:
-                my_max_dist = float(pt_ctr_dists[n])
-                my_seed = int(n)
 
-    return k_ctrs
+def run_GSE(output_name, params):
+        
+    if type(params['-max_rand_tessellations']) == list:
+        fill_params(params)
+    max_rand_tessellations = int(params['-max_rand_tessellations'])
+    inference_eignum = int(params['-inference_eignum'])
+    inference_dim = int(params['-inference_dim'])
+    GSE_final_eigenbasis_size = int(params['-final_eignum'])
+    worker_processes = int(params['-ncpus'])
+    filter_retention = float(params['-filter_retention'])
+    num_subsets = int(params['-num_subsets'])
+    sysOps.globaldatapath = str(params['-path'])
+    this_GSEobj = GSEobj(inference_dim,inference_eignum)
+    
+    sysOps.throw_status("params = " + str(params))
+    if '-init_min_contig' not in params or num_subsets == 0:
+        tmp_params = dict(params)
+        tmp_params['-path'] = sysOps.globaldatapath
+        tmp_params['-is_subset'] = True
+        full_gse('GSEoutput.txt',tmp_params)
+        return
+        
+    if not sysOps.check_file_exists(output_name):
+        
+        linear_interp_sub_solutions(this_GSEobj, params, num_subsets)
+        try:
+            os.mkdir(sysOps.globaldatapath + "filtered//")
+        except:
+            pass
+        
+        if not sysOps.check_file_exists("filtered//link_assoc.txt"):
+            filter_data(this_GSEobj, num_subsets, newdir = sysOps.globaldatapath + "filtered//", retention_fraction = filter_retention)
+        del this_GSEobj #clear memory
+        sysOps.globaldatapath += "filtered//"
+        params['-path'] = sysOps.globaldatapath
+        params['-is_subset'] = True
+        params['-intermed_indexing_directory'] = "..//"
+        params['-calc_final'] = "..//..//"
+        this_GSEobj = GSEobj(inference_dim,inference_eignum)
+        this_GSEobj.path = sysOps.globaldatapath
+        np.save(this_GSEobj.path + "rms_dists.npy",np.load(this_GSEobj.path + "../rms_dists.npy")[this_GSEobj.index_key])
+        
+        if not sysOps.check_file_exists("filtered//preorthbasis.npy"):
+            np.save(sysOps.globaldatapath + 'preorthbasis.npy',np.concatenate([np.loadtxt(sysOps.globaldatapath + '..//finalres' + str(sub_index) + '.txt',delimiter=',',dtype=np.float64)[this_GSEobj.index_key,1:] for sub_index in range(num_subsets)],axis=1))
+        del this_GSEobj.link_data, this_GSEobj.seq_evecs
+        
+        full_gse(output_name, params)
+    
+def cluster_raw(output_name, params):
 
+    # load link_assoc.txt
+    fill_params(params)
+    sysOps.globaldatapath = str(params['-path'])
+    this_GSEobj = GSEobj(None,None)
+    sysOps.globaldatapath += 'cluster_raw//'
+    try:
+        os.mkdir(sysOps.globaldatapath)
+    except:
+        sysOps.throw_status(sysOps.globaldatapath + ' already exists.')
+    sysOps.sh("cp -p " + sysOps.globaldatapath + "..//index_key.txt " + sysOps.globaldatapath + ".")
+    
+    leiden_res_list = [1,10,20]
+    
+    if not sysOps.check_file_exists(output_name):
+        adj_data = csr_matrix((this_GSEobj.link_data[:,2], (np.int32(this_GSEobj.link_data[:,0]), np.int32(this_GSEobj.link_data[:,1]))), (this_GSEobj.Npts, this_GSEobj.Npts))
+        del this_GSEobj.link_data
+        final_memberships = list([np.arange(this_GSEobj.Npts).reshape([this_GSEobj.Npts,1])])
+        sources, targets = adj_data.nonzero()
+        edges = list(zip(sources, targets))
+        mygraph = igraph.Graph(edges=edges)
+        mygraph.es['weight'] = adj_data.data
+        del adj_data
+        for leiden_res in leiden_res_list:
+            sysOps.throw_status('Performing leiden clustering using resolution = ' + str(leiden_res))
+            partition_type = leidenalg.RBConfigurationVertexPartition
+            partition = leidenalg.find_partition(mygraph, partition_type, weights=mygraph.es['weight'], resolution_parameter=leiden_res)
+            sysOps.throw_status('Done.')
+            final_memberships.append(np.array(partition.membership).reshape([this_GSEobj.Npts,1]))
+                    
+        np.savetxt(sysOps.globaldatapath + output_name, np.concatenate(final_memberships,axis=1),fmt='%i',delimiter=',')
+        
+    if (params['-calc_final'] is not None):
+        print_final_results(output_name,len(leiden_res_list),label_dir="..//..//" + params['-calc_final'],intermed_indexing_directory=params['-intermed_indexing_directory'])
+    sysOps.sh("rm " + sysOps.globaldatapath + "index_key* " + sysOps.globaldatapath + "label*")
+    
 def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
     sysOps.globaldatapath = str(globaldatapath)
-    try:
-        os.mkdir(sysOps.globaldatapath + 'tmp')
-    except:
-        pass
     while True: # check for kill-switch
         handshake_filename = None
         while True: # await instructions
@@ -231,61 +303,49 @@ def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
         if len(gse_tasks) == 0:
             sysOps.throw_status('Error: ' + sysOps.globaldatapath + "_" + handshake_filename + ' is empty.')
             sysOps.exitProgram()
-        if 'divdir' in gse_tasks:
-            divdir = str(gse_tasks['divdir'])
-            if 'slice' in gse_tasks:
-                eig_cut = int(divdir[3:].strip('/'))
-                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                minpts = max(2*(inference_eignum+1),int(np.sqrt(this_GSEobj.Npts)))
-                maxpts = minpts*10
-                ctr_assignments = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-                pt_ctr_dists = -np.ones(this_GSEobj.Npts,dtype=np.float64)
-                ctr_pt_indices = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-                ctr_memberships = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-                sysOps.throw_status(str(proc_ind) + ': Calling farthest point with maxpts = ' + str(maxpts))
-                
-                while True:
-                    k_ctrs = farthest_pt(ctr_assignments,pt_ctr_dists,ctr_pt_indices,ctr_memberships,this_GSEobj.seq_evecs.T,this_GSEobj.Npts,maxpts,np.random.randint(this_GSEobj.Npts))
-                       
-                    index_link_array = np.arange(this_GSEobj.Npts,dtype=np.int64)
-                    min_contig_edges(index_link_array,ctr_assignments,this_GSEobj.link_data,this_GSEobj.link_data.shape[0])
-                    sysOps.throw_status('Identified ' + str(k_ctrs) + ' centers.')
-                    if k_ctrs >= this_GSEobj.Npts:
-                        sysOps.throw_status('Calling farthest point again ...')
-                    else:
-                        break
-                
-                ctr_assignments, old_segment_lookup = generate_complete_indexed_arr(index_link_array)
-                np.savetxt(this_GSEobj.path + 'Xpts_segment_None.txt',
-                           np.concatenate([this_GSEobj.index_key.reshape([this_GSEobj.Npts,1]), ctr_assignments.reshape([this_GSEobj.Npts,1])],axis = 1),fmt='%i,%i',delimiter=',')
-                                    
-                del ctr_assignments, pt_ctr_dists, ctr_pt_indices, ctr_memberships, index_link_array, old_segment_lookup
+        if 'tessdir' in gse_tasks:
+            tessdir = str(gse_tasks['tessdir'])
+            if 'tesselate' in gse_tasks:
+                tesselation = int(tessdir[4:].strip('/'))
+                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
+                minpts = 2*(inference_eignum+1)
+                k_ctrs = min(int(np.sqrt(this_GSEobj.Npts)/2.0),int(this_GSEobj.Npts/(2*minpts)))
+                if not sysOps.check_file_exists('Xpts_segment_None.txt',this_GSEobj.path):
+                    ctr_assignments =stochastic_kmeans(this_GSEobj.seq_evecs.T, k_ctrs, minpts, max_iter=10)
+                    
+                    np.savetxt(this_GSEobj.path + 'Xpts_segment_None.txt',
+                               np.concatenate([this_GSEobj.index_key.reshape([this_GSEobj.Npts,1]), ctr_assignments.reshape([this_GSEobj.Npts,1])],axis = 1),fmt='%i,%i',delimiter=',')
+                                        
+                    del ctr_assignments
                 try:
-                    os.remove(sysOps.globaldatapath + divdir + 'reindexed_Xpts_segment_None.txt')
+                    os.remove(sysOps.globaldatapath + tessdir + 'reindexed_Xpts_segment_None.txt')
                 except:
                     pass
-                this_GSEobj.make_subdirs(seg_filename='Xpts_segment_None.txt',min_seg_size=minpts,reassign_orphans=True)
+                preorthbasis_path = None
+                rms_path = None
+                this_GSEobj.make_subdirs(seg_filename='Xpts_segment_None.txt',min_seg_size=minpts,reassign_orphans=True,preorthbasis_path=None,rms_path=rms_path)
                 del this_GSEobj
             
             elif 'eigs' in gse_tasks:
-                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
+                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
+                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
                 if max_segment_index < 0:
-                    sysOps.throw_status("Error: could not find " + sysOps.globaldatapath + divdir + 'seg0/link_assoc.txt')
+                    sysOps.throw_status("Error: could not find " + sysOps.globaldatapath + tessdir + 'seg0/link_assoc.txt')
                     sysOps.exitProgram()
                 # front-load mean evecs for each segment so that these can be referenced in each sub-solution
                 for subdir in ['seg' + str(seg_ind) + '//' for seg_ind in range(int(gse_tasks['eigs'].split('-')[0]),int(gse_tasks['eigs'].split('-')[1]))]:
-                    seg_GSEobj = GSEobj(inference_dim=inference_dim,inference_eignum=inference_eignum,bipartite_data=False,inp_path=divdir + subdir)
+                    seg_GSEobj = GSEobj(inference_dim=inference_dim,inference_eignum=inference_eignum,bipartite_data=False,inp_path=tessdir + subdir)
                     seg_GSEobj.max_segment_index = max_segment_index
-                    seg_GSEobj.path = sysOps.globaldatapath + divdir + subdir
+                    seg_GSEobj.path = sysOps.globaldatapath + tessdir + subdir
                     #if not sysOps.check_file_exists('pseudolink_assoc_0_reindexed.txt',seg_GSEobj.path):
-                    seg_GSEobj.eigen_decomp(orth=False)
+                    
+                    seg_GSEobj.eigen_decomp(orth=False,krylov_approx=None)
                     del seg_GSEobj
                             
             elif 'seg_orth' in gse_tasks:
-                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
-                seg_assignments = np.loadtxt(sysOps.globaldatapath + divdir + 'reindexed_Xpts_segment_None.txt',delimiter=',',dtype=np.int64)[:,1]
+                this_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
+                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
+                seg_assignments = np.loadtxt(sysOps.globaldatapath + tessdir + 'reindexed_Xpts_segment_None.txt',delimiter=',',dtype=np.int64)[:,1]
                 ctrs = np.zeros([this_GSEobj.seq_evecs.shape[0],max_segment_index+1],dtype=np.float64)
                 seg_bins = np.zeros(max_segment_index+1,dtype=np.float64)
                 for n in range(seg_assignments.shape[0]):
@@ -295,29 +355,29 @@ def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
                     ctrs[:,i] /= seg_bins[i]
                 del seg_assignments
                 for subdir in ['seg' + str(seg_ind) + '//' for seg_ind in range(int(gse_tasks['seg_orth'].split('-')[0]),int(gse_tasks['seg_orth'].split('-')[1]))]:
-                    seg_GSEobj = GSEobj(inference_dim,inference_eignum,False,inp_path=divdir + subdir)
+                    seg_GSEobj = GSEobj(inference_dim,inference_eignum,False,inp_path=tessdir + subdir)
                     seg_GSEobj.max_segment_index = max_segment_index
                     assign_bool_array = np.zeros(seg_GSEobj.Npts,dtype=np.bool_)
-                    assign_bool_array[seg_GSEobj.index_key > seg_GSEobj.max_segment_index] = True
+                    assign_bool_array[seg_GSEobj.index_key > seg_GSEobj.max_segment_index] = True # True for indices corresponding to points (not segments)
                     
-                    relative_orth_arr = np.zeros([seg_GSEobj.Npts,this_GSEobj.seq_evecs.shape[0]],dtype=np.float64)
+                    relative_orth_arr = np.zeros([seg_GSEobj.Npts,this_GSEobj.seq_evecs.shape[0]],dtype=np.float64) # set to "global" eigenvectors
                     relative_orth_arr[assign_bool_array,:] = this_GSEobj.seq_evecs[:,seg_GSEobj.index_key[seg_GSEobj.index_key > seg_GSEobj.max_segment_index] - (seg_GSEobj.max_segment_index+1)].T
                     relative_orth_arr[~assign_bool_array,:] = ctrs[:,seg_GSEobj.index_key[seg_GSEobj.index_key <= seg_GSEobj.max_segment_index]].T
                     
-                    evecs_large = np.load(sysOps.globaldatapath + divdir + subdir + "evecs.npy")
-                    print(str([relative_orth_arr.shape,evecs_large.shape]))
-                    evecs_large = np.concatenate([relative_orth_arr,evecs_large],axis=1)
-                    orth_evecs = np.zeros(evecs_large.shape,dtype=np.float64)
-                    pt_buff = np.zeros(orth_evecs.shape[1],dtype=np.float64)
-                    orth_evecs[:,:relative_orth_arr.shape[1]] = relative_orth_arr[:,:]
+                    evecs_large = np.load(sysOps.globaldatapath + tessdir + subdir + "evecs.npy")
+                    evals = np.loadtxt(sysOps.globaldatapath + tessdir + subdir + "evals.txt")
+                    #evecs_large = np.concatenate([relative_orth_arr,evecs_large],axis=1)
+                    orth_evecs = evecs_large #np.zeros(evecs_large.shape,dtype=np.float64)
+                    #pt_buff = np.zeros(orth_evecs.shape[1],dtype=np.float64)
+                    #orth_evecs[:,:relative_orth_arr.shape[1]] = relative_orth_arr[:,:]
 
-                    orth_weights = np.ones(seg_GSEobj.Npts,dtype=np.float64)/np.sum(seg_GSEobj.index_key > seg_GSEobj.max_segment_index)
-                    orth_weights[seg_GSEobj.index_key <= seg_GSEobj.max_segment_index] = 1
-                    orth_weights /= np.sum(orth_weights)
-                    gs(orth_evecs,evecs_large,pt_buff,relative_orth_arr.shape[1],evecs_large.shape[1],orth_weights,seg_GSEobj.Npts)
-                    orth_evecs = orth_evecs[:,relative_orth_arr.shape[1]:] # remove extra vectors
+                    #orth_weights = np.ones(seg_GSEobj.Npts,dtype=np.float64)/np.sum(seg_GSEobj.index_key > seg_GSEobj.max_segment_index)
+                    #orth_weights[seg_GSEobj.index_key <= seg_GSEobj.max_segment_index] = 1
+                    #orth_weights /= np.sum(orth_weights)
+                    #gs(orth_evecs,evecs_large,pt_buff,relative_orth_arr.shape[1],evecs_large.shape[1],orth_weights,seg_GSEobj.Npts)
+                    #orth_evecs = orth_evecs[:,relative_orth_arr.shape[1]:] # remove extra vectors
                     
-                    del relative_orth_arr, assign_bool_array
+                    del relative_orth_arr
                     
                     # consolidate subdirectory solutions into eigen-basis
                     # vectorized representation will have following columns
@@ -325,11 +385,15 @@ def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
                     # 2. segment index (sorted) -- enumerated from 0 to max_segment_index + 1 + Npts
                     # 3-. segmentation solution (having dimensionality this_GSEobj.spat_dims)
                 
-                    index_key = np.loadtxt(sysOps.globaldatapath + divdir + subdir + "index_key.txt",delimiter=',',dtype=np.int64)
-                    for i in range(orth_evecs.shape[1]):
-                        divisor = np.max(np.diff(np.sort(orth_evecs[:,i])))
-                        if divisor > 0: # in rare occasions this will not be true, in which case do not rescale eigenvector
-                            orth_evecs[:,i] /= divisor
+                    index_key = np.loadtxt(sysOps.globaldatapath + tessdir + subdir + "index_key.txt",delimiter=',',dtype=np.int64)
+                    sum_links = np.add(seg_GSEobj.sum_pt_tp1_link,seg_GSEobj.sum_pt_tp2_link)
+                    for i in range(this_GSEobj.seq_evecs.shape[0]):
+                        row_argsort = np.argsort(orth_evecs[:,i])
+                        inv_argsort = -np.ones(seg_GSEobj.Npts,dtype=np.int32)
+                        inv_argsort[row_argsort] = np.arange(seg_GSEobj.Npts)
+                        max_gap = np.median(np.diff(np.sort(orth_evecs[assign_bool_array,i])))/(1+evals[i])
+                        if max_gap > 0: # in rare occasions this will not be true, in which case do not rescale eigenvector
+                            orth_evecs[:,i] /= max_gap
                     orth_evecs = np.concatenate([np.zeros([orth_evecs.shape[0],1]),orth_evecs],axis=1)
                     orth_evecs[index_key[:,2],0] = index_key[:,1]
                     subdir_index = int(subdir[3:].strip('/'))
@@ -340,30 +404,35 @@ def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
                         sysOps.throw_status(str(orth_evecs[orth_evecs[:,0] == orth_evecs[:,1],:]))
                         sysOps.exitProgram()
                     
-                    np.savetxt(sysOps.globaldatapath + divdir + "//part_Xpts" + str(subdir_index) + ".txt",orth_evecs,
+                    np.savetxt(sysOps.globaldatapath + tessdir + "//part_Xpts" + str(subdir_index) + ".txt",orth_evecs,
                                fmt='%i,%i,' + ','.join(['%.10e' for i in range(orth_evecs.shape[1]-2)]),delimiter = ',')
                 del this_GSEobj
                 
             if 'collate' in gse_tasks:
-                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
+                max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
                 orig_evecs = np.load(sysOps.globaldatapath + 'orig_evecs_gapnorm.npy')
                 Npts = orig_evecs.shape[0]
+                
                 orig_evecs = np.concatenate([np.ones([Npts,2])*(max_segment_index+1),orig_evecs],axis=1)
                 orig_evecs[:,1] = np.arange(Npts) + max_segment_index+1
-                np.savetxt(sysOps.globaldatapath + divdir + "part_Xpts" + str(max_segment_index+1) + ".txt",orig_evecs,
+                np.savetxt(sysOps.globaldatapath + tessdir + "part_Xpts" + str(max_segment_index+1) + ".txt",orig_evecs,
                            fmt='%i,%i,' + ','.join(['%.10e' for i in range(orig_evecs.shape[1]-2)]),delimiter = ',')
                 del orig_evecs
-                sysOps.sh("cat " + sysOps.globaldatapath + divdir + "part_Xpts* > " + sysOps.globaldatapath + divdir + "collated_Xpts.txt")
-                sysOps.big_sort(" -k2n,2 -k1n,1 -t \",\" ","collated_Xpts.txt","sorted_collated_Xpts.txt",sysOps.globaldatapath + divdir)
-                sysOps.sh("rm " + sysOps.globaldatapath + divdir + "part_Xpts*")
-                os.remove(sysOps.globaldatapath + divdir + "collated_Xpts.txt")
-                collated_Xpts = np.loadtxt(sysOps.globaldatapath + divdir + 'sorted_collated_Xpts.txt',delimiter=',',dtype=np.float64)
+                
+                if max_segment_index >= 0:
+                    sysOps.sh("cat " + sysOps.globaldatapath + tessdir + "part_Xpts* > " + sysOps.globaldatapath + tessdir + "collated_Xpts.txt")
+                else:
+                    sysOps.sh("cp -p " + sysOps.globaldatapath + tessdir + "part_Xpts* " + sysOps.globaldatapath + tessdir + "collated_Xpts.txt")
+                sysOps.big_sort(" -k2n,2 -k1n,1 -t \",\" ","collated_Xpts.txt","sorted_collated_Xpts.txt",sysOps.globaldatapath + tessdir)
+                sysOps.sh("rm " + sysOps.globaldatapath + tessdir + "part_Xpts*")
+                os.remove(sysOps.globaldatapath + tessdir + "collated_Xpts.txt")
+                collated_Xpts = np.loadtxt(sysOps.globaldatapath + tessdir + 'sorted_collated_Xpts.txt',delimiter=',',dtype=np.float64)
                 argsort_solns = np.argsort(collated_Xpts[:,0])
                 soln_starts = np.append(np.append(0,1+np.where(np.diff(collated_Xpts[argsort_solns,0])>0)[0]),collated_Xpts.shape[0])
                 pts_seg_starts = np.append(np.append(0,1+np.where(np.diff(collated_Xpts[:,1])>0)[0]),collated_Xpts.shape[0])
-                np.savetxt(sysOps.globaldatapath + divdir + "argsort_solns.txt",argsort_solns,fmt='%i',delimiter = ',')
-                np.savetxt(sysOps.globaldatapath + divdir + "soln_starts.txt",soln_starts,fmt='%i',delimiter = ',')
-                np.savetxt(sysOps.globaldatapath + divdir + "pts_seg_starts.txt",pts_seg_starts,fmt='%i',delimiter = ',')
+                np.savetxt(sysOps.globaldatapath + tessdir + "argsort_solns.txt",argsort_solns,fmt='%i',delimiter = ',')
+                np.savetxt(sysOps.globaldatapath + tessdir + "soln_starts.txt",soln_starts,fmt='%i',delimiter = ',')
+                np.savetxt(sysOps.globaldatapath + tessdir + "pts_seg_starts.txt",pts_seg_starts,fmt='%i',delimiter = ',')
                 
                 global_coll_indices = -np.ones(Npts,dtype=np.int64)
                 local_coll_indices = -np.ones(Npts,dtype=np.int64)
@@ -373,52 +442,56 @@ def GSE(proc_ind,inference_dim,inference_eignum,globaldatapath):
                             global_coll_indices[n] = i
                         else:
                             local_coll_indices[n] = i
-                np.savetxt(sysOps.globaldatapath + divdir + "global_coll_indices.txt",global_coll_indices,fmt='%i',delimiter = ',')
-                np.savetxt(sysOps.globaldatapath + divdir + "local_coll_indices.txt",local_coll_indices,fmt='%i',delimiter = ',')
+                np.savetxt(sysOps.globaldatapath + tessdir + "global_coll_indices.txt",global_coll_indices,fmt='%i',delimiter = ',')
+                np.savetxt(sysOps.globaldatapath + tessdir + "local_coll_indices.txt",local_coll_indices,fmt='%i',delimiter = ',')
                 del global_coll_indices, local_coll_indices, argsort_solns, soln_starts, pts_seg_starts, collated_Xpts
                 
             if 'knn' in gse_tasks:
                 # get collated data array
-                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
+                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
+                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
                     
                 collated_dim = inference_eignum
-                nn = 2*collated_dim
+                nn = 2*inference_eignum
                 new_GSEobj.print_status = False
-                for soln_ind in range(int(gse_tasks['knn'].split('-')[0]),int(gse_tasks['knn'].split('-')[1])):
-                    new_GSEobj.knn(soln_ind, nn)
+                if new_GSEobj.max_segment_index >= 0:
+                    for soln_ind in range(int(gse_tasks['knn'].split('-')[0]),int(gse_tasks['knn'].split('-')[1])):
+                        new_GSEobj.knn(soln_ind, nn)
+                else:
+                    new_GSEobj.knn(-1, nn)
+                    indices_and_distances = np.loadtxt(new_GSEobj.path + 'nn_indices-1.txt',delimiter=',',dtype=np.float64)
+                    np.savetxt(new_GSEobj.path+ "nbr_indices_0.txt",indices_and_distances[:,1:int(indices_and_distances.shape[1]/2)],delimiter=',',fmt='%i')
+                    np.savetxt(new_GSEobj.path+ "nbr_distances_0.txt",indices_and_distances[:,int(1 + indices_and_distances.shape[1]/2):],delimiter=',',fmt='%.10e')
+                    del indices_and_distances
+                    
                 #new_GSEobj.eigen_decomp(True,True,orig_evec_path = sysOps.globaldatapath)
-                #sysOps.sh("cp -p " + sysOps.globaldatapath + divdir + "quantiles.txt " + sysOps.globaldatapath + "quantiles.txt")
+                #sysOps.sh("cp -p " + sysOps.globaldatapath + tessdir + "quantiles.txt " + sysOps.globaldatapath + "quantiles.txt")
                 del new_GSEobj
-                
-            if 'manifold' in gse_tasks:
-                start_ind = int(gse_tasks['manifold'].split('-')[0])
-                end_ind = int(gse_tasks['manifold'].split('-')[1])
-                if not sysOps.check_file_exists(divdir + "manifold_vecs~" + str(start_ind) + "~" + str(end_ind) + "~.txt"):
-                    new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                    new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
+                               
+            if 'select_nn' in gse_tasks:
+                start_ind = int(gse_tasks['select_nn'].split('-')[0])
+                end_ind = int(gse_tasks['select_nn'].split('-')[1])
+                if not sysOps.check_file_exists(tessdir + "nbr_indices_0~" + str(start_ind) + "~" + str(end_ind) + "~.txt"):
+                    new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
+                    new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
                     new_GSEobj.print_status = False
-                    new_GSEobj.calc_manifolds(start_ind,end_ind)
+                    new_GSEobj.select_nn(start_ind,end_ind)
                     del new_GSEobj
             
-            if 'ellipsoid' in gse_tasks:
-                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
+            if 'shortest_path' in gse_tasks:
+                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
                 new_GSEobj.print_status = False
-                new_GSEobj.calc_ellipsoids(int(gse_tasks['ellipsoid'].split('-')[0]),int(gse_tasks['ellipsoid'].split('-')[1]))
+                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
+                new_GSEobj.shortest_path(int(gse_tasks['shortest_path'].split('-')[0]),int(gse_tasks['shortest_path'].split('-')[1]))
+                # intervals are regulated as quantiles to reinforce a specific total number of landmark loci across the data set
                 del new_GSEobj
-                        
-            if 'smooth_ellipsoid' in gse_tasks:
-                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
+                                                                    
+            if 'final_quantile_computation' in gse_tasks:
+                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=tessdir)
                 new_GSEobj.print_status = False
-                new_GSEobj.smooth_ellipsoids(int(gse_tasks['smooth_ellipsoid'].split('-')[0]),int(gse_tasks['smooth_ellipsoid'].split('-')[1]))
-                del new_GSEobj
-                                    
-            if 'quantiles' in gse_tasks:
-                new_GSEobj = GSEobj(inference_dim,inference_eignum,inp_path=divdir)
-                new_GSEobj.print_status = False
-                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + divdir +  'max_segment_index.txt',dtype=np.int64))
-                new_GSEobj.quantile_computation(int(gse_tasks['quantiles'].split('-')[0]),int(gse_tasks['quantiles'].split('-')[1]))
+                new_GSEobj.max_segment_index = int(np.loadtxt(sysOps.globaldatapath + tessdir +  'max_segment_index.txt',dtype=np.int64))
+                new_GSEobj.final_quantile_computation(int(gse_tasks['final_quantile_computation'].split('-')[0]),int(gse_tasks['final_quantile_computation'].split('-')[1]))
+                # intervals are regulated as quantiles to reinforce a specific total number of landmark loci across the data set
                 del new_GSEobj
                                 
         if 'gradient' in gse_tasks:
@@ -481,6 +554,22 @@ def get_outer_associations(link_assoc_buff,segment_bins,seg_assignments,link_dat
             
     return
                        
+                       
+@jit("void(float64[:,:],float64[:,:],int64[:,:],int64[:,:],int64,bool_)",nopython=True)
+def ave_outer_basis(ave_preorthbasis,preorthbasis,segment_bins,seg_assignments,Npts,divide_total):
+    
+    ave_preorthbasis[:,:] = 0.0
+    for n in range(Npts):
+        seg = seg_assignments[n,1]
+        seg_size = segment_bins[seg,0]+segment_bins[seg,1]
+        if divide_total:
+            ave_preorthbasis[seg,:] += preorthbasis[n,:]/seg_size
+        else:
+            ave_preorthbasis[seg,:] += preorthbasis[n,:]
+            
+    return
+                       
+                       
 @jit("int64(float64[:,:],int64)",nopython=True)
 def aggregate_associations(assoc_array,num_assoc):
     # assumes assoc_array is *pre-sorted* by first 2 columns
@@ -495,7 +584,6 @@ def aggregate_associations(assoc_array,num_assoc):
                 
 @jit("int64(float64[:,:],int64[:,:],int64[:],int64[:,:],int64[:],int64[:],float64[:,:],int64[:],int64,int64,int64,int64,int64)",nopython=True)
 def get_inner_associations(link_assoc,segment_bins,sorted_seg_starts,seg_assignments,sorted_link_data_inds,sorted_link_data_ind_starts,link_data,argsort_seg,seg_ind,Nassoc,Npt_tp1,max_segment_index,min_seg_size):
-
     on_assoc = 0
     for i in range(sorted_seg_starts[seg_ind],sorted_seg_starts[seg_ind+1]):
         pts1 = argsort_seg[i] + max_segment_index + 1
@@ -511,13 +599,13 @@ def get_inner_associations(link_assoc,segment_bins,sorted_seg_starts,seg_assignm
                 pts2 = int(seg_assignments[pts2,1])
                 link_assoc[on_assoc,0] = pts2
                 link_assoc[on_assoc,1] = pts1
-                link_assoc[on_assoc,2] = link_data[sorted_link_data_inds[j]%Nassoc,2]/(segment_bins[seg_assignments[pts2,1],int(pts2_as_pt >= Npt_tp1)])
+                link_assoc[on_assoc,2] = link_data[sorted_link_data_inds[j]%Nassoc,2]/(segment_bins[pts2,int(pts2_as_pt >= Npt_tp1)])
             on_assoc += 1
     
     return on_assoc
 
 def print_subsample_pts(this_GSEobj,nbr_index_filename,nbr_distance_filename,print_bipartite=True):
-
+                    
     has_pt_tp1_arr = ((this_GSEobj.sum_pt_tp1_link) > 0)
     has_pt_tp2_arr = ((this_GSEobj.sum_pt_tp2_link) > 0)
     Npt_tp1 = np.sum(has_pt_tp1_arr)
@@ -527,8 +615,8 @@ def print_subsample_pts(this_GSEobj,nbr_index_filename,nbr_distance_filename,pri
         sysOps.exitProgram()
     sysOps.throw_status('Loading subsampled indices for GT approximation, print_bipartite = ' + str(print_bipartite) + ' ...')
     num_quantiles = 2
-    sub_num = 10*(this_GSEobj.spat_dims)
-    tp_factors = np.zeros([this_GSEobj.Npts,1],dtype=np.float64)
+    sub_num = 2*this_GSEobj.inference_eignum
+    tp_factors = np.zeros([this_GSEobj.Npts,1],dtype=np.float32)
     if print_bipartite:
         tp_factors[has_pt_tp1_arr] = Npt_tp2
         tp_factors[has_pt_tp2_arr] = Npt_tp1
@@ -539,63 +627,71 @@ def print_subsample_pts(this_GSEobj,nbr_index_filename,nbr_distance_filename,pri
     self_indices = list()
     indices = list()
     multipliers = list()
-    nbr_indices = np.load(sysOps.globaldatapath + nbr_index_filename)
+    nbr_indices = np.int32(np.load(sysOps.globaldatapath + nbr_index_filename))
+
+    sysOps.throw_status('Loaded indices.')
     if nbr_distance_filename is None:
         nbr_distances = None
     else:
-        nbr_distances = np.load(sysOps.globaldatapath + nbr_distance_filename)
+        nbr_distances = np.bool_(np.load(sysOps.globaldatapath + nbr_distance_filename)>=0) # boolean information alone is needed here
+        sysOps.throw_status('Loaded distances.')
+        
     for q in range(num_quantiles+1):
-        
-        my_self_indices = np.outer(np.arange(this_GSEobj.Npts,dtype=np.int64),np.ones(nbr_indices[:,:,q].shape[1],dtype=np.int64))
-                
-        if (nbr_distances is not None) and q < num_quantiles:
-            my_multipliers = np.multiply(nbr_indices[:,:,q] >=0,nbr_distances[:,:,q] >=0,dtype=np.float64)
-        else:
-            my_multipliers = np.float64(nbr_indices[:,:,q] >=0)
-        for n in range(this_GSEobj.Npts):
-            if print_bipartite:
-                my_multipliers[n,my_multipliers[n,:]>0] = np.multiply(my_multipliers[n,my_multipliers[n,:]>0],has_pt_tp1_arr[n]!=has_pt_tp1_arr[new_indices[n,my_multipliers[n,:]>0]])
-            sumrow = np.sum(my_multipliers[n,:])
-            if sumrow > 0:
-                my_multipliers[n,:] /= sumrow
-                
-        # here, assign quantile to a fraction of the sample that any measurement within it will *represent*
-        if q == 0:
-            frac_Npts_represented = sub_num/this_GSEobj.Npts
-        elif q == 1:
-            frac_Npts_represented = (1.0/(2**this_GSEobj.spat_dims)) - (sub_num/this_GSEobj.Npts)
-        else:
-            frac_Npts_represented = (1.0-(1.0/(2**this_GSEobj.spat_dims)))
+        if not sysOps.check_file_exists("subsample_pairings_" +str(q) + ".npz"):
+            sysOps.throw_status('Starting q = ' + str(q))
+            num_cols = nbr_indices.shape[1]
+            my_self_indices = np.outer(np.arange(this_GSEobj.Npts,dtype=np.int32),np.ones(num_cols,dtype=np.int32))
             
-        my_multipliers = frac_Npts_represented*np.multiply(my_multipliers,tp_factors)
-        my_multipliers = my_multipliers.reshape(np.prod(my_multipliers.shape))
-        new_indices = nbr_indices[:,:,q].reshape(np.prod(nbr_indices.shape[:2]))
-        my_self_indices = my_self_indices.reshape(np.prod(my_self_indices.shape))
+            if (nbr_distances is not None) and q < num_quantiles:
+                my_multipliers = np.multiply(nbr_indices[:,:,q] >=0,nbr_distances[:,:,q],dtype=np.float32)
+            else:
+                my_multipliers = np.float32(nbr_indices[:,:,q] >=0)
         
-        indices.append(np.array(new_indices[my_multipliers>0]))
-        multipliers.append(np.array(my_multipliers[my_multipliers>0]))
-        self_indices.append(np.array(my_self_indices[my_multipliers>0]))
+            #if q > 0:
+            #    my_multipliers = np.multiply(my_multipliers,np.load(sysOps.globaldatapath + "nbr_weights.npy")[:,:,q-1]) # first layer is non-nn lower quantile-weights
+        
+            for n in range(this_GSEobj.Npts):
+                if print_bipartite:
+                    my_multipliers[n,my_multipliers[n,:]>0] = np.multiply(my_multipliers[n,my_multipliers[n,:]>0],has_pt_tp1_arr[n]!=has_pt_tp1_arr[new_indices[n,my_multipliers[n,:]>0]])
+                sumrow = np.sum(my_multipliers[n,:])
+                if sumrow > 0:
+                    my_multipliers[n,:] /= sumrow
+                
+            # here, assign quantile to a fraction of the sample that any measurement within it will *represent*
+            if q == 0:
+                frac_Npts_represented = sub_num/this_GSEobj.Npts
+            elif q == 1:
+                frac_Npts_represented = (1.0/(2**this_GSEobj.spat_dims)) - (sub_num/this_GSEobj.Npts)
+            else:
+                frac_Npts_represented = (1.0-(1.0/(2**this_GSEobj.spat_dims)))
             
-    indices = np.concatenate(indices)
-    multipliers = np.concatenate(multipliers)
-    self_indices = np.concatenate(self_indices)
-        
-    if print_bipartite:
-        multipliers *= (Npt_tp1*Npt_tp2)/np.sum(multipliers)
-    else:
-        multipliers *= 0.5*this_GSEobj.Npts*(this_GSEobj.Npts-1)/np.sum(multipliers)
+            my_multipliers = frac_Npts_represented*np.multiply(my_multipliers,tp_factors)
+            my_multipliers = my_multipliers.reshape(np.prod(my_multipliers.shape))
+            new_indices = nbr_indices[:,:,q].reshape(np.prod(nbr_indices.shape[:2]))
+            my_self_indices = my_self_indices.reshape(np.prod(my_self_indices.shape))
+            sysOps.throw_status('Formatting ...') 
+            my_multipliers = np.float32(my_multipliers)
+            rows = np.array(my_self_indices[my_multipliers>0])
+            cols = np.array(new_indices[my_multipliers>0])
+            my_multipliers = my_multipliers[my_multipliers>0]
+            del my_self_indices, new_indices
+            sysOps.throw_status('Saving ...')
+            csc = csc_matrix((my_multipliers, (rows,cols)), (this_GSEobj.Npts,this_GSEobj.Npts))
+            del rows,cols,my_multipliers
+            save_npz(sysOps.globaldatapath + "subsample_pairings_" +str(q) + ".npz",csc)
+            # store info on non-zero elements
+            with open(sysOps.globaldatapath + 'nnz_' + str(q) + '.txt','w') as nnzfile:
+                nnzfile.write(str(csc.data.shape[0]))
+            del csc
+            sysOps.throw_status('Appended q = ' + str(q))
+        else:
+            sysOps.throw_status("Found subsample_pairings_" +str(q) + ".npz")
+
+    del nbr_indices
+    if nbr_distances is not None:
+        del nbr_distances
+    sysOps.throw_status('Done.')
     
-    pairings = np.zeros([multipliers.shape[0],3],dtype=np.float64)
-    pairings[:,0] = np.minimum(self_indices,indices)
-    pairings[:,1] = np.maximum(self_indices,indices)
-    pairings[:,2] = multipliers
-    del self_indices, indices, multipliers
-    
-    # get array having the same format as link_data
-    
-    sysOps.throw_status("Passed get_subsample_pts()")
-    #pairings = np.array(sorted(pairings.tolist(), key = lambda x: (x[0], x[1])))
-    np.save(sysOps.globaldatapath + "subsample_pairings.npy",pairings)
     return
 
 def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None):
@@ -603,11 +699,21 @@ def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None):
         
     subGSEobj_eignum = int(sub_GSEobj.inference_eignum)
     manifold_increment = sub_GSEobj.spat_dims
-    sysOps.throw_status("Incrementing eigenspace: " + str(manifold_increment) + " with scale_boundaries " + str(sub_GSEobj.scale_boundaries))
+    sysOps.throw_status("Incrementing eigenspace: " + str(manifold_increment))
     X = None
     init_eig_count = sub_GSEobj.spat_dims
     eig_count = int(init_eig_count)
     
+    if sysOps.check_file_exists("rescale_" + output_Xpts_filename):
+        sysOps.throw_status("Found " + sysOps.globaldatapath + "rescale_" + output_Xpts_filename)
+        my_Xpts = np.loadtxt(sysOps.globaldatapath + "rescale_" + output_Xpts_filename,delimiter=',',dtype=np.float64)[:,1:(sub_GSEobj.spat_dims+1)]
+        sqdists_per_assoc = np.sum(np.square(np.subtract(my_Xpts[np.int64(sub_GSEobj.link_data[:,0]),:],my_Xpts[np.int64(sub_GSEobj.link_data[:,1]),:])),axis=1)
+        wvals = np.exp(-sqdists_per_assoc)
+        wvals /= np.sum(wvals)
+        Nuei = np.sum(sub_GSEobj.link_data[:,2])
+        
+        sub_GSEobj.link_data[:,2] = np.multiply(sub_GSEobj.link_data[:,2],wvals*(Nuei/sub_GSEobj.link_data[:,2]))
+        
     while True:
         # SOLVE SUB-GSEobj
         if eig_count == init_eig_count and (X is None):
@@ -623,7 +729,7 @@ def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None):
         
         # pre-calculate back-projection matrix: calculate inner-product of eigenvector matrix with itself, and invert to compensate for lack of orthogonalization between eigenvectors
         sub_GSEobj.reset_subsample = True 
-        if eig_count>=manifold_increment and (eig_count%manifold_increment == 0  or eig_count in sub_GSEobj.scale_boundaries):
+        if eig_count>=manifold_increment and (eig_count%manifold_increment == 0 or eig_count == subGSEobj_eignum):
             sysOps.throw_status('Optimizing eigencomponent ' + str(eig_count) + '/' + str(subGSEobj_eignum) + ' in ' + str(sub_GSEobj.spat_dims) + 'D.')
             sub_GSEobj.print_status = False
             
@@ -648,293 +754,7 @@ def spec_GSEobj(sub_GSEobj, output_Xpts_filename = None):
     sub_GSEobj.inference_eignum = int(subGSEobj_eignum) # return to original value
     return my_Xpts
             
-# NUMBA declaration
-@jit("void(float64[:,:],int64[:],float64[:,:],int64[:],float64[:],float64[:],bool_[:],bool_[:],int64)",nopython=True)
-def sum_links_and_reassign_indices(pt_tp1_sorted_link_data,pt_tp1_sorted_link_data_starts,
-                                  local_pt_tp1_sorted_link_data,local_index_lookup,
-                                  sum_pt_tp1_link,sum_pt_tp2_link,
-                                  pts_inclusion_arr,assoc_inclusion_arr,Npt_tp1):
-    
-    # Function is called when new data arrays need to be used from a superset of pts to generate data arrays
-    # corresponding to a pts subset
-    for n_super in range(Npt_tp1):
-        # Note that looping through type-1 pts is done a way to navigate through the FULL link matrix
-        # sorted as pt_tp1_sorted_link_data
-        # pt_tp1_sorted_link_data_starts stores data with same dimensionality as GSEobj.link_data, but sorted by type-1 index
-        #     Column ordering: type-1-index, type-2-index, link_count
-        for i in range(pt_tp1_sorted_link_data_starts[n_super],
-                       pt_tp1_sorted_link_data_starts[n_super+1]):
-            pt_tp1_index = int(pt_tp1_sorted_link_data[i,0])
-            pt_tp2_index = int(pt_tp1_sorted_link_data[i,1])
-            if pts_inclusion_arr[pt_tp1_index] and pts_inclusion_arr[pt_tp2_index]:
-                # retention of link data in new data subset arrays requires that BOTH type-1- and type-2-pts
-                # referred to by a link entry belong to the designated subset
-                assoc_inclusion_arr[i] = True
-                sum_pt_tp1_link[local_index_lookup[pt_tp1_index]] += pt_tp1_sorted_link_data[i,2]
-                sum_pt_tp2_link[local_index_lookup[pt_tp2_index]] += pt_tp1_sorted_link_data[i,2]
-                local_pt_tp1_sorted_link_data[i,0] = local_index_lookup[pt_tp1_index]
-                local_pt_tp1_sorted_link_data[i,1] = local_index_lookup[pt_tp2_index]
-    
-    return
-
-def get_sparsest_cut(pt_tp1_sorted_link_data, pt_tp1_sorted_link_data_starts,pts_inclusion_arr,
-                     local_sum_pt_tp1_link, local_sum_pt_tp2_link, local_Npts, eig_cut = 1):
-    
-    # Function performs symmetric Graph Laplacian decomposition, 
-    # and sweeps the lowest-magnitude non-trivial eigenvector for the division between points that minimizes link conductance
-    # Inputs:
-    #    1. pt_tp1_sorted_link_data: link_data that has not YET been sub-sampled according to the boolean array pts_inclusion_array, sorted by type-1 index
-    #    2. pt_tp1_sorted_link_data_starts: array of where links start for each type-1 pts
-    #    3. pts_inclusion_array: boolean array indicating which pts (whose indices in this array are referred to in first 2 columns of pt_tp1_sorted_link_data)
-    #        will be analyzed in this function call
-    #    4. local_sum_pt_tp1_link: (unassigned) total link counts belonging to type-1s at designated pts index local to True elements of pts_inclusion_arr
-    #    5. local_sum_pt_tp2_link: (unassigned) total link counts belonging to type-2s at designated pts index local to True elements of pts_inclusion_arr
-    #    6. local_Npts total True elements in pts_inclusion_arr
-    
-    local_sum_pt_tp1_link[:] = 0
-    local_sum_pt_tp2_link[:] = 0
-    
-    assoc_inclusion_arr = np.zeros(pt_tp1_sorted_link_data.shape[0],dtype=np.bool_)
-    # boolean array keeps track of which associations (corresponding to the rows of pt_tp1_sorted_link_data)
-    # will be retained on account of the pts being included according to input array pts_inclusion_arr
-    
-    local_index_lookup = -np.ones(pts_inclusion_arr.shape[0],dtype=np.int64)
-    # indicies will correspond to super-set's indices, values will correspond to sub-set indices
-    local_index_lookup[pts_inclusion_arr] = np.arange(local_Npts)
-
-    local_pt_tp1_sorted_link_data = np.array(pt_tp1_sorted_link_data)
-    
-    # tabulate local (sub-set) statistics, replace indices in local_pt_tp1_sorted_link_data with sub-set indicies
-    sum_links_and_reassign_indices(pt_tp1_sorted_link_data,pt_tp1_sorted_link_data_starts,
-                                  local_pt_tp1_sorted_link_data,local_index_lookup,
-                                  local_sum_pt_tp1_link,local_sum_pt_tp2_link,
-                                  pts_inclusion_arr,assoc_inclusion_arr,pt_tp1_sorted_link_data_starts.shape[0]-1)
-    
-    local_Nassoc = np.sum(assoc_inclusion_arr)
-    
-    # remake link array to ONLY include associations retained according to input array pts_inclusion_arr
-    # local_pt_tp1_sorted_link_data_starts and local_pt_tp2_sorted_link_data_starts will store locations in
-    # local_pt_tp1_sorted_link_data and local_pt_tp2_sorted_link_data, respectively, where type-1 or type-2 pts's
-    
-    local_pt_tp1_sorted_link_data = local_pt_tp1_sorted_link_data[assoc_inclusion_arr,:]
-    local_pt_tp1_sorted_link_data_starts = np.append(np.append(0,1+np.where(np.diff(local_pt_tp1_sorted_link_data[:,0])>0)[0]),
-                                                 local_pt_tp1_sorted_link_data.shape[0])
-    local_pt_tp2_sorted_link_data = local_pt_tp1_sorted_link_data[np.argsort(local_pt_tp1_sorted_link_data[:,1]),:]
-    local_pt_tp2_sorted_link_data_starts = np.append(np.append(0,1+np.where(np.diff(local_pt_tp2_sorted_link_data[:,1])>0)[0]),
-                                                 local_pt_tp2_sorted_link_data.shape[0])
-    
-    row_indices = np.arange(local_Npts + 2*local_Nassoc, dtype=np.int64)
-    col_indices = np.arange(local_Npts + 2*local_Nassoc, dtype=np.int64)
-    norm_link_data = np.zeros(local_Npts + 2*local_Nassoc, dtype=np.float64)
-    
-    # Generate symmetric Graph Laplacian with local link data, initiate sparse matrix data object
-    get_normalized_sparse_matrix(local_sum_pt_tp1_link,local_sum_pt_tp2_link,
-                                 row_indices,col_indices,
-                                 norm_link_data,local_pt_tp1_sorted_link_data,
-                                 local_Nassoc,local_Npts,True,np.ones(local_Nassoc,dtype=np.float64)) # get symmetrized Laplacian to perform sparsest cut
-                    
-    #norm_link_data[:local_Npts] = 0.0
-    #for i in range(local_Npts,norm_link_data.shape[0]):
-    #    norm_link_data[i] /= (local_sum_pt_tp1_link[col_indices[i]] + local_sum_pt_tp2_link[col_indices[i]])
-    #    norm_link_data[row_indices[i]] -= norm_link_data[i]
-    csc_op = csc_matrix((norm_link_data, (row_indices, col_indices)), (local_Npts, local_Npts)) # getting left eigenvectors of row-normalized GL
-    csc_op.sum_duplicates()
-    k=2+eig_cut
-    if local_Npts <= k:
-        evals, evecs = LA.eigh(csc_op.toarray())
-        eval_order = np.argsort(np.abs(evals))
-        evecs = evecs[:,eval_order]
-        evals = evals[eval_order]
-    else:
-        evals, evecs = scipy.sparse.linalg.lobpcg(csc_op, np.random.randn(local_Npts,k), maxiter=100, tol = 1e-4)
-    # remove trivial eigenvector
-    eval_order = np.argsort(np.abs(evals))
-    evecs = evecs[:,eval_order]
-    evals = evals[eval_order]
-    triv_eig_index = np.argmin(np.var(evecs[:,:(k)],axis = 0))
-    evals = evals[np.where(np.arange(k) != triv_eig_index)[0]]
-    if eig_cut > 0:
-        top_nontriv_evec = evecs[:,np.where(np.arange(k) != triv_eig_index)[0][eig_cut-1]]
-    else:
-        top_nontriv_evec = evecs[:,np.where(np.arange(k) != triv_eig_index)[0][0]]
-    ordered_evec_indices = np.argsort(top_nontriv_evec)
-    cut_passed = np.zeros(local_Npts,dtype=np.bool_)
-    
-    min_conductance_ptr = np.array([0],dtype=np.float64)
-    min_conductance_assoc_ptr = np.array([0],dtype=np.int64)
-    local_Npt_tp1 = int(local_pt_tp1_sorted_link_data_starts.shape[0]-1)
-    if eig_cut > 0:
-        cut_passed[top_nontriv_evec > np.mean(top_nontriv_evec)] = True
-    else:
-        sparsest_cut(min_conductance_ptr,min_conductance_assoc_ptr,
-                     local_pt_tp1_sorted_link_data,local_pt_tp1_sorted_link_data_starts,
-                     local_pt_tp2_sorted_link_data,local_pt_tp2_sorted_link_data_starts,
-                     local_sum_pt_tp1_link, local_sum_pt_tp2_link,
-                     ordered_evec_indices,
-                     cut_passed,
-                     local_Npts, local_Npt_tp1)
-
-    return (min_conductance_ptr[0], None, cut_passed, local_pt_tp1_sorted_link_data, local_pt_tp1_sorted_link_data_starts)
-
-# NUMBA declaration
-@jit("void(float64[:],int64[:],float64[:,:],int64[:],float64[:,:],int64[:],float64[:],float64[:],int64[:],bool_[:],int64,int64)",nopython=True)
-def sparsest_cut(min_conductance_ptr,min_conductance_assoc_ptr,
-                 local_pt_tp1_sorted_link_data,local_pt_tp1_sorted_link_data_starts,
-                 local_pt_tp2_sorted_link_data,local_pt_tp2_sorted_link_data_starts,
-                 local_sum_pt_tp1_links, local_sum_pt_tp2_links,
-                 ordered_evec_indices,
-                 cut_passed, 
-                 local_Npts, local_Npt_tp1):
-    # Function sweeps the lowest-magnitude non-trivial eigenvector for the division between points that minimizes link conductance
-    # Note: top_symm_nontriv_evec must be delivered from an eigen-decomposition of a symmetrized Graph laplacian in order for sparsest cut to work properly
-    # assumes indexing of pt_tp1_sorted_link_data is done according to same indices as top_nontriv_evec
-    
-    n = ordered_evec_indices[0]
-    cut_passed[n] = True
-    
-    if n < local_Npt_tp1:
-        my_cut_assoc = local_pt_tp1_sorted_link_data_starts[n+1]-local_pt_tp1_sorted_link_data_starts[n]
-    else:
-        my_cut_assoc = local_pt_tp2_sorted_link_data_starts[n-local_Npt_tp1+1]-local_pt_tp2_sorted_link_data_starts[n-local_Npt_tp1]
-        
-    my_cut_flow = local_sum_pt_tp1_links[n] + local_sum_pt_tp2_links[n]
-    left_volume = int(my_cut_flow) # left side's volume all corresponds to edges flowing to right
-    right_volume = -int(my_cut_flow)
-    for n in range(local_Npts):
-        right_volume += local_sum_pt_tp1_links[n] + local_sum_pt_tp2_links[n]
-        
-    min_cut_conductance = 1.0 # flow divided by graph volume
-    min_cut_conductance_assoc = int(my_cut_assoc)
-    min_cut_index = 0
-    
-    for my_cut_index in range(1,local_Npts-1): # my_cut_index is the index BEFORE the cut
-        n = ordered_evec_indices[my_cut_index]
-        if n < local_Npt_tp1:
-            for i in range(local_pt_tp1_sorted_link_data_starts[n],local_pt_tp1_sorted_link_data_starts[n+1]):
-                if cut_passed[int(local_pt_tp1_sorted_link_data[i,1])]:
-                    my_cut_flow -= local_pt_tp1_sorted_link_data[i,2]
-                    my_cut_assoc -= 1
-                else:
-                    my_cut_flow += local_pt_tp1_sorted_link_data[i,2]
-                    my_cut_assoc += 1
-        else:
-            for i in range(local_pt_tp2_sorted_link_data_starts[n-local_Npt_tp1],local_pt_tp2_sorted_link_data_starts[n-local_Npt_tp1+1]):
-                if cut_passed[int(local_pt_tp2_sorted_link_data[i,0])]:
-                    my_cut_flow -= local_pt_tp2_sorted_link_data[i,2]
-                    my_cut_assoc -= 1
-                else:
-                    my_cut_flow += local_pt_tp2_sorted_link_data[i,2]
-                    my_cut_assoc += 1
-                    
-        cut_passed[n] = True
-        left_volume += local_sum_pt_tp1_links[n] + local_sum_pt_tp2_links[n]
-        right_volume -= local_sum_pt_tp1_links[n] + local_sum_pt_tp2_links[n]
-        
-        if min(left_volume,right_volume) != 0:
-            my_cut_conductance = float(my_cut_flow)/float(min(left_volume,right_volume)) # definition of conductance
-            if my_cut_conductance < min_cut_conductance:
-                min_cut_conductance = float(my_cut_conductance)
-                min_cut_conductance_assoc = int(my_cut_assoc)
-                min_cut_index = int(my_cut_index)
-    
-    for n in range(min_cut_index+1):
-        cut_passed[ordered_evec_indices[n]] = False
-    
-    for n in range(min_cut_index+1,local_Npts):
-        cut_passed[ordered_evec_indices[n]] = True
-    
-    min_conductance_ptr[0] = min_cut_conductance
-    min_conductance_assoc_ptr[0] = min_cut_conductance_assoc
-    
-    return
-
-def rec_sparsest_cut(pt_tp1_sorted_link_data,pt_tp1_sorted_link_data_starts,pts_inclusion_array,
-                     my_start_index,stopping_conductance,stopping_assoc,maxpts,minpts,minlink,eig_cut = 1, recursive_counter = 0):
-    # Function is recursively called on progressively smaller subsets of data
-    # Cuts are performed using the spectral approximation to the sparsest cut, through calls to get_sparsest_cut()
-    # Reminder: an ASSOCIATION is a unique pts/pts pairing
-    # link_data arrays have size = (total associations,3) --> 3 columns = (type-1 pts index, type-2 pts index, number of links for this association)
-    # Inputs:
-    #    1. pt_tp1_sorted_link_data: link_data that has not YET been sub-sampled according to the boolean array pts_inclusion_array, sorted by type-1 index
-    #    2. pt_tp1_sorted_link_data_starts: array of where links start for each type-1 pts
-    #    3. pts_inclusion_array: boolean array indicating which pts (whose indices in this array are referred to in first 2 columns of pt_tp1_sorted_link_data)
-    #        will be analyzed in this function call
-    #    4. my_start_index: current GROUPING index, ensures that when group indices are returned, they are non-overlapping
-    #    5. stopping_conductance:  required stop-cut criterion (if != None),  if sparsest cut conductance falls above this, do not perform cut
-    #    6. stopping_assoc:  required stop-cut criterion (if != None),  if associations across sparsest cut fall above this, do not perform cut
-    #    7. maxpts: required stop-cut criterion (if != None), number of pts in current partition <= maxpts
-    #    8. minpts: required FULL CUT (segment each point separately) criterion, number of pts in current partition < minpts
-    #    9. minlink: link pruning criteria --> no pts may remain within a partition if by restricting analysis to that partition it has fewer than this number of links
-    
-    # pts_inclusion_array is passed as a boolean array for which only True elements are addressed in this call of rec_sparsest_cut()
-    local_Npts = np.sum(pts_inclusion_array)
-    if local_Npts < minpts or recursive_counter == 99:
-        return np.add(my_start_index,np.arange(local_Npts,dtype=np.int64)) # if number of True elements in pts_inclusion_array is below a minimum, return
-    
-    local_sum_pt_tp1_link = np.zeros(local_Npts,dtype=np.float64)
-    local_sum_pt_tp2_link = np.zeros(local_Npts,dtype=np.float64)
-             
-    if (stopping_conductance is None) and (stopping_assoc is None) and ((maxpts is None) or local_Npts <= maxpts):
-        sysOps.throw_status('Found block of size ' + str(local_Npts))
-        return np.multiply(my_start_index,np.ones(local_Npts,dtype=np.int64))
-    
-    (min_conductance, min_conductance_assoc, cut_passed,
-     local_pt_tp1_sorted_link_data,
-     local_pt_tp1_sorted_link_data_starts) = get_sparsest_cut(pt_tp1_sorted_link_data, pt_tp1_sorted_link_data_starts,pts_inclusion_array,local_sum_pt_tp1_link, local_sum_pt_tp2_link, local_Npts,eig_cut)
-    # returned values of get_sparsest_cut():
-    #    1. min_conductance: links(connecting PART A, PART B)/min(links from PART A, links from PART B) --> with BOTH PART A and PART B among the True elements of pts_inclusion_array
-    #    2. min_conductance_assoc: number of distinct type-1 pts - type-2 pts associations connecting PART A to PART B
-    #    3. cut_passed: boolean array designating which pts belong to PART A and PART B of cut
-    #    4. local_pt_tp1_sorted_link_data: link data sub-set corresponding to portion of pt_tp1_sorted_link_data corresponding to pts corresponding to True elements of pts_inclusion_array (sorted by type-1 index, ie the first column)
-    #    5. local_pt_tp1_sorted_link_data_starts: integer array containing start indices of type-1 pts in local_pt_tp1_sorted_link_data
-         
-    if (((stopping_conductance is not None and min_conductance >= stopping_conductance) or (stopping_conductance is None))
-        and (((stopping_assoc is not None) and min_conductance_assoc >= stopping_assoc) or (stopping_assoc is None))
-        and (maxpts is None or local_Npts <= maxpts)):
-        sysOps.throw_status('Found block of size ' + str(local_Npts) + ', min_conductance = ' + str(min_conductance))
-        return np.multiply(my_start_index,np.ones(local_Npts,dtype=np.int64))
-    
-    assoc_inclusion_arr = np.ones(local_pt_tp1_sorted_link_data.shape[0],dtype=np.bool_)
-    for i in np.where(cut_passed[np.int64(local_pt_tp1_sorted_link_data[:,0])] != cut_passed[np.int64(local_pt_tp1_sorted_link_data[:,1])])[0]:
-        local_sum_pt_tp1_link[int(local_pt_tp1_sorted_link_data[i,0])] -= local_pt_tp1_sorted_link_data[i,2]
-        local_sum_pt_tp2_link[int(local_pt_tp1_sorted_link_data[i,1])] -= local_pt_tp1_sorted_link_data[i,2]
-        assoc_inclusion_arr[i] = np.False_
-        
-    remove_assoc = np.zeros(local_pt_tp1_sorted_link_data.shape[0],dtype=np.bool_)
-    while True:
-        remove_assoc = np.multiply(assoc_inclusion_arr,
-                                   np.add(local_sum_pt_tp1_link[np.int64(local_pt_tp1_sorted_link_data[:,0])]<minlink,
-                                          local_sum_pt_tp2_link[np.int64(local_pt_tp1_sorted_link_data[:,1])]<minlink))
-        if np.sum(remove_assoc) == 0:
-            break
-
-        for i in np.where(remove_assoc)[0]:
-            local_sum_pt_tp1_link[int(local_pt_tp1_sorted_link_data[i,0])] -= local_pt_tp1_sorted_link_data[i,2]
-            local_sum_pt_tp2_link[int(local_pt_tp1_sorted_link_data[i,1])] -= local_pt_tp1_sorted_link_data[i,2]
-        
-        assoc_inclusion_arr = np.multiply(assoc_inclusion_arr,~remove_assoc)
-        
-    index_link_array = np.arange(local_Npts,dtype=np.int64)
-    if np.sum(assoc_inclusion_arr) > 0: 
-        # perform single linkage clustering on the current partitioned data sets to ensure that after pruning, to establish contiguous data sets given pruning so far in the function
-        min_contig_edges(index_link_array,np.int64(cut_passed),
-                         local_pt_tp1_sorted_link_data[assoc_inclusion_arr,:],
-                         np.sum(assoc_inclusion_arr))
-        
-    sorted_index_link_array = np.argsort(index_link_array)
-    index_link_starts = np.append(np.append(0,1+np.where(np.diff(index_link_array[sorted_index_link_array])>0)[0]),sorted_index_link_array.shape[0])
-    grp_inclusion = np.zeros(local_Npts,dtype=np.bool_)
-    grp_indices = -np.ones(local_Npts,dtype=np.int64)
-    for i in range(index_link_starts.shape[0]-1):
-        grp_inclusion[sorted_index_link_array[index_link_starts[i]:index_link_starts[i+1]]] = np.True_ # set to true those items in the boolean array that will be addressed during this call to rec_sparsest_cut()
-        grp_indices[grp_inclusion] = rec_sparsest_cut(local_pt_tp1_sorted_link_data,local_pt_tp1_sorted_link_data_starts,
-                                                      grp_inclusion,
-                                                      my_start_index,stopping_conductance,stopping_assoc,maxpts,minpts,minlink,eig_cut,recursive_counter+1)
-        my_start_index = np.max(grp_indices[grp_inclusion])+1
-        grp_inclusion[sorted_index_link_array[index_link_starts[i]:index_link_starts[i+1]]] = np.False_ # re-set
-    
-    return grp_indices # return segmented indices for True items in pts_inclusion_array
-    
+            
 def generate_complete_indexed_arr(arr):
     
     # Function generates complete-indexing for 2D array's non-negative entries
@@ -961,89 +781,172 @@ def generate_complete_indexed_arr(arr):
         return np.reshape(tmp_arr,[arr.shape[0],arr.shape[1]]), index_lookup
     else:
         return np.array(tmp_arr), index_lookup
+                   
+       
+@njit("int64(int32[:,:],int32[:,:],float64[:,:],int32[:,:],float64[:,:],float64[:],bool_[:,:],int64)",fastmath=True)
+def get_triplets(Arows,Acols,Avals,pair_lookup,triplet_coef,bvec,use_pairing,num_landmarks):
     
-def segmentation_analysis(this_GSEobj, stopping_conductance, min_conductance_assoc, inp_eig_cut = 1, maxpts = None, minpts =50, minlink =2):
-    # Perform segmentation analysis
-    # Input:
-    #    1. this_GSEobj: GSEobj object for performing eigendecomposition
-    #    2. stopping_conductance: min-conductance threshold  (if != None)
-    #    3. min_conductance_assoc: required  (if != None) number of pts-pts associations across putative cut in order to stop cutting
-    #    4. maxpts: required stop-cut criterion (if != None), number of pts in current partition <= maxpts
-    #    5. minpts: required FULL CUT (segment each point separately) criterion, number of pts in current partition < minpts
-    #    6. minlink: link pruning criteria --> no pts may remain within a partition if by restricting analysis to that partition it has fewer than this number of links
+    triplet = 0
+    for j in range(num_landmarks):
+        for k in range(j):
+            if use_pairing[j,k]:
+                dist1 = bvec[pair_lookup[j,k]]
+                discrepancy = None
+                for ell in range(num_landmarks):
+                    dist2 = bvec[pair_lookup[k,ell]]
+                    dist3 = bvec[pair_lookup[j,ell]]
+                    if dist2 < dist1 and dist2 >= dist3:
+                        dist_median = dist2
+                    elif dist3 < dist1 and dist3 >= dist2:
+                        dist_median = dist3
+                    else:
+                        dist_median = dist1
+                    my_discrepancy = max(dist1-(dist2+dist3),max(dist2-(dist1+dist3),dist3-(dist2+dist1)))/dist_median
+                    if ell == 0 or my_discrepancy > discrepancy:
+                        discrepancy = float(my_discrepancy)
+                        l = int(ell)
+                    
+                dist2 = bvec[pair_lookup[k,l]]
+                dist3 = bvec[pair_lookup[j,l]]
+                max_dist = max(dist1,max(dist2,dist3))
+                if max_dist == dist1:
+                    on_pair = 0
+                elif max_dist == dist2:
+                    on_pair = 1
+                else:
+                    on_pair = 2
+                #for on_pair in range(3):
+                Arows[triplet,:] = triplet
+                Acols[triplet,0] = pair_lookup[j,k]
+                Acols[triplet,1] = pair_lookup[k,l]
+                Acols[triplet,2] = pair_lookup[j,l]
+                Avals[triplet,:] = triplet_coef[on_pair,:]
+                triplet += 1
+            
+    return triplet
 
-    if this_GSEobj.bipartite_data:
-        pt_tp1_sorted_link_data = np.array(this_GSEobj.link_data)
-    else:
-        pt_tp1_sorted_link_data = np.concatenate([this_GSEobj.link_data,this_GSEobj.link_data[:,np.array([1,0,2])]],axis=0)
-        # this will double-up data in call to segmentation, but will not affect normalize graph laplacian values
-        
-    pt_tp1_sorted_link_data = pt_tp1_sorted_link_data[np.argsort(pt_tp1_sorted_link_data[:,0]),:]
-    pt_tp1_sorted_link_data_starts = np.append(np.append(0,1+np.where(np.diff(pt_tp1_sorted_link_data[:,0])>0)[0]),pt_tp1_sorted_link_data.shape[0])
-        
-    segmentation_assignments = rec_sparsest_cut(pt_tp1_sorted_link_data,pt_tp1_sorted_link_data_starts,np.ones(this_GSEobj.Npts,dtype=np.bool_),
-                                                0,stopping_conductance,min_conductance_assoc,maxpts,minpts,minlink,eig_cut = inp_eig_cut, recursive_counter = 0)
-    segmentation_assignments, old_segment_lookup = generate_complete_indexed_arr(segmentation_assignments)
+def triangle_update(shortest_paths_dists, shortest_paths_inds, spat_dims, limit_pairings = None):
+                    
+    sysOps.throw_status("Performing triangle-update with " + str(shortest_paths_inds.shape[0]) + " landmarks ...")
+    shortest_paths_dists[shortest_paths_dists < 1E-10] = 1E-10
+    shortest_paths_dists[np.isinf(shortest_paths_dists)+np.isnan(shortest_paths_dists)] = np.max(shortest_paths_dists[np.multiply(~np.isinf(shortest_paths_dists),~np.isnan(shortest_paths_dists))]) # set infinities to the maximum non-infinity
+    Npts = shortest_paths_dists.shape[0]
+    num_landmarks = shortest_paths_dists.shape[1]
+    is_landmark = np.zeros(Npts,dtype=np.bool_)
+    is_landmark[shortest_paths_inds[:]] = True
     
-    np.savetxt(this_GSEobj.path + 'Xpts_segment_' + str(stopping_conductance) + '.txt',
-               np.concatenate([this_GSEobj.index_key.reshape([this_GSEobj.Npts,1]),
-                               segmentation_assignments.reshape([this_GSEobj.Npts,1])],axis = 1),fmt='%i,%i',delimiter=',')
-            
-            
-@jit("void(int64[:,:],float64[:,:],float64[:,:],int64[:,:],int64[:],float64[:],int64,int64,int64,bool_)",nopython=True)
-def filter_errvals(indexfile,distfile,disterrfile,source_divs,index_argsort_buff,newrow_buff,max_incl,Npts,cols,randomize):
+    pair_idx = 0
+    pair_lookup = -np.ones([num_landmarks,num_landmarks],dtype=np.int32)
+    bvec = -np.ones(num_landmarks**2,dtype=np.float64)
     
-    EPS = 1E-10
-   
-    for n in range(Npts):
+    Bmat_orig = np.zeros([num_landmarks,num_landmarks],dtype=np.float64)
+    if limit_pairings is None:
+        use_pairing = np.ones([num_landmarks,num_landmarks],dtype=np.bool_) # define which pairings to incorporate into triplet constraints
+    else: # assume limit_pairings is float between 0 and 1
+        sysOps.throw_status("Sampling " + str(limit_pairings))
+        use_pairing = (np.random.uniform(0,1,num_landmarks**2) < limit_pairings).reshape([num_landmarks,num_landmarks])
+            
+    sysOps.throw_status("Pairwise lookup ...")
+    for j in range(num_landmarks):
+        for k in range(j):
+            pair_lookup[j,k] = pair_idx
+            pair_lookup[k,j] = pair_idx
+            bvec[pair_idx] = min(shortest_paths_dists[shortest_paths_inds[j],k],shortest_paths_dists[shortest_paths_inds[k],j])
+            Bmat_orig[j,k] = bvec[pair_idx]
+            Bmat_orig[k,j] = bvec[pair_idx]
+            pair_idx += 1
+    sysOps.throw_status("Done.")
+                    
+    bvec = bvec[:pair_idx]
+    triplet_coef = np.ones([3,3],dtype=np.float64)
+    triplet_coef[0,0] = -1
+    triplet_coef[1,1] = -1
+    triplet_coef[2,2] = -1
+    num_triplets = int(3*(num_landmarks**2)/2)
+    Avals = np.zeros([num_triplets,3],dtype=np.float64)
+    Arows = -np.ones([num_triplets,3],dtype=np.int32)
+    Acols = -np.ones([num_triplets,3],dtype=np.int32)
+    
+    sysOps.throw_status("Getting triplets ...")
+    triplet = get_triplets(Arows,Acols,Avals,pair_lookup,triplet_coef,bvec,use_pairing,num_landmarks)
+            
+    sysOps.throw_status("Done.")
+    
+    Arows = Arows[:triplet,:].reshape(3*triplet)
+    Acols = Acols[:triplet,:].reshape(3*triplet)
+    Avals = Avals[:triplet,:].reshape(3*triplet)
+    
+    good_indices = np.multiply(Arows >= 0,Acols >= 0)
+    Arows = Arows[good_indices]
+    Acols = Acols[good_indices]
+    Avals = Avals[good_indices]
+    triplet = np.max(Arows)+1
+    # append with identity matrix
+    Arows = np.concatenate([Arows,np.arange(triplet,triplet+pair_idx,dtype=np.int32)])
+    Acols = np.concatenate([Acols,np.arange(pair_idx,dtype=np.int32)])
+    Avals = np.concatenate([Avals,np.ones(pair_idx,dtype=np.float64)])
+    triplet = np.max(Arows)+1
+    
+    Amat = csc_matrix((Avals, (Arows, Acols)), (triplet,pair_idx))
+    del Arows,Acols,Avals
+    Amat.sum_duplicates()
         
-        if randomize:
-            index_argsort_buff[:] = np.random.permutation(cols)
-        else:
-            index_argsort_buff[:] = np.argsort(disterrfile[n,:])
-            
-        for i in range(cols):
-            newrow_buff[i] = distfile[n,index_argsort_buff[i]]
-        for i in range(cols):
-            distfile[n,i] = newrow_buff[i]
-                    
-        for i in range(cols):
-            newrow_buff[i] = indexfile[n,index_argsort_buff[i]]
-        for i in range(cols):
-            indexfile[n,i] = newrow_buff[i]
-                    
-        for i in range(cols):
-            newrow_buff[i] = disterrfile[n,index_argsort_buff[i]]
-        for i in range(cols):
-            disterrfile[n,i] = newrow_buff[i]
-            
-        source_divs[n,:] = index_argsort_buff[:cols]
-            
-        incl = 0
-        for i in range(cols):
-            if distfile[n,i] > EPS and indexfile[n,i] >= 0 and indexfile[n,i]!=n and np.sum(indexfile[n,:i] == indexfile[n,i]) == 0:
-                distfile[n,incl] = distfile[n,i]
-                indexfile[n,incl] = indexfile[n,i]
-                disterrfile[n,incl] = disterrfile[n,i]
-                source_divs[n,incl] = source_divs[n,i]
-                incl += 1
-                
-            if incl >= max_incl:
-                break
-                    
-        distfile[n,incl:] = -1
-        indexfile[n,incl:] = -1
-        disterrfile[n,incl:] = -1
-        source_divs[n,incl:] = -1
-        
+    # construct a sparse matrix Amat that has the inequality condition Ax >= 0
+    # initiate P as 2 * identity matrix
+    P = 2 * csc_matrix((np.ones(pair_idx,dtype=np.float64), (range(pair_idx), range(pair_idx))), (pair_idx,pair_idx))
+    q = -2*bvec
+    h = np.zeros(triplet)
+    
+    # Solve the QP
+    sysOps.throw_status("Constructing OSQP object ...")
+    prob = osqp.OSQP()
+    # Create the h vector for lower bounds (Gx >= 0)
+    l = np.zeros(triplet)
+    # Upper bounds
+    u = np.inf * np.ones(triplet)
+    sysOps.throw_status("Setting up ...")
+    # Setup workspace and change alpha parameter (adaptivity)
+    prob.setup(P, q, Amat, l, u) #, eps_abs=1e-5, eps_rel=1e-5, eps_prim_inf=1e-5, eps_dual_inf=1e-5, adaptive_rho=True)
+
+    # Solve the problem
+    sysOps.throw_status("Solving QP ...")
+    results = prob.solve()
+    sysOps.throw_status("Done.")
+
+    # Extract solution
+    x = results.x
+    Bmat = np.zeros([num_landmarks,num_landmarks],dtype=np.float64)
+    for j in range(num_landmarks):
+        for k in range(j):
+            Bmat[j,k] = x[pair_lookup[j,k]]
+            Bmat[k,j] = x[pair_lookup[k,j]]
+    
+    # find linear transform
+    sysOps.throw_status("Finding linear transform ...")
+    LinTransf_logspace = LA.pinv(np.log(1.0 + Bmat_orig)).dot(np.log(1.0 + Bmat))
+    shortest_paths_dists[shortest_paths_dists < 1E-10] = 1E-10
+    sysOps.throw_status("Multiplying broader data set ...")
+    quantile_boundary = spat_dims
+    mean_per_row = np.partition(shortest_paths_dists, quantile_boundary, axis=1)[:, quantile_boundary]
+    shortest_paths_dists[:,:] = np.exp(np.log(1.0 + shortest_paths_dists).dot(LinTransf_logspace)) - 1.0
+    shortest_paths_dists[shortest_paths_dists < 1E-10] = 1E-10
+    sysOps.throw_status("np.mean(shortest_paths_dists) = " + str(np.mean(shortest_paths_dists)))
+    shortest_paths_dists = np.multiply(shortest_paths_dists,np.outer(np.divide(mean_per_row,np.partition(shortest_paths_dists, quantile_boundary, axis=1)[:, quantile_boundary]),np.ones(shortest_paths_dists.shape[1]))) # rescale distances according to earlier mean value
+    sysOps.throw_status("np.mean(shortest_paths_dists) = " + str(np.mean(shortest_paths_dists)))
+    sysOps.throw_status("Done.")
     return
-    
+        
 def fill_params(params):
 
-    if '-max_eig_cuts' in params:
-        params['-max_eig_cuts'] = int(params['-max_eig_cuts'][0])
+    # if unloaded from list, place params back in list
+    for el in params:
+        if type(params[el]) != list and type(params[el]) != bool:
+            params[el] = list([params[el]])
+
+    if '-max_rand_tessellations' in params: # Number of tessellations to be done in the eigenvector subspace.
+        params['-max_rand_tessellations'] = int(params['-max_rand_tessellations'][0])
     else:
-        params['-max_eig_cuts'] = 5
+        params['-max_rand_tessellations'] = 1
     if '-inference_eignum' in params:
         params['-inference_eignum'] = int(params['-inference_eignum'][0])
     else:
@@ -1052,10 +955,6 @@ def fill_params(params):
         params['-inference_dim'] = int(params['-inference_dim'][0])
     else:
         params['-inference_dim'] = 2
-    if '-iterations' in params:
-        params['-iterations'] = int(params['-iterations'][0])
-    else:
-        params['-iterations'] = 1
     if '-final_eignum' in params:
         params['-final_eignum'] = int(params['-final_eignum'][0])
     else:
@@ -1072,6 +971,23 @@ def fill_params(params):
         params['-num_subsets'] = int(params['-num_subsets'][0])
     else:
         params['-num_subsets'] = 1
+    if '-filter_retention' in params:
+        params['-filter_retention'] = float(params['-filter_retention'][0])
+    else:
+        params['-filter_retention'] = 1.0
+    if '-calc_final' in params:
+        if len(params['-calc_final']) == 0:
+            params['-calc_final'] = ""
+        else:
+            params['-calc_final'] = str(params['-calc_final'][0])
+    else:
+        params['-calc_final'] = None
+    
+    if '-intermed_indexing_directory' in params:
+        params['-intermed_indexing_directory'] = str(params['-intermed_indexing_directory'][0])
+    else:
+        params['-intermed_indexing_directory'] = None
+        
     if '-path' in params:
         params['-path'] = str(params['-path'][0])
         if not params['-path'].endswith('/'):
@@ -1086,34 +1002,37 @@ def fill_params(params):
             elif type(params[el]) != bool:
                 paramfile.write(el + ' ' + str(params[el]) + '\n')
     
-def fast_GSE(this_GSEobj, params, sub_index, init_min_contig = 1000):
+
+def fast_GSE(this_GSEobj, params, sub_index, init_min_contig = 1000, init_sample_1 = None, init_sample_2 = None):
     
-    max_eig_cuts = int(params['-max_eig_cuts'])
+    max_rand_tessellations = int(params['-max_rand_tessellations'])
     inference_eignum = int(params['-inference_eignum'])
     inference_dim = int(params['-inference_dim'])
-    GSE_iterations = int(params['-iterations'])
     GSE_final_eigenbasis_size = int(params['-final_eignum'])
     worker_processes = int(params['-ncpus'])
-    gamma = 0 #float(params['-gamma'])
     sysOps.globaldatapath = str(params['-path'])
     min_assoc = 2
     sysOps.throw_status('Initiating FastGSE ...')
     
     if not sysOps.check_file_exists('coverage.npy'):
-        coverage = np.zeros(this_GSEobj.Npts,dtype=np.int64)
+        coverage = np.random.uniform(low=-0.5, high=0.5, size=this_GSEobj.Npts)
     else:
-        coverage = np.load(sysOps.globaldatapath +'coverage.npy')
+        coverage = np.load(sysOps.globaldatapath +'coverage.npy') + np.random.uniform(low=-0.5, high=0.5, size=this_GSEobj.Npts)
     
-    if not sysOps.check_file_exists('subset_GSE' + str(sub_index) + '//subGSEoutput.txt'):
+    if not sysOps.check_file_exists('subset_GSE' + str(sub_index) + '//GSEoutput.txt'):
         if not sysOps.check_file_exists('subset_GSE' + str(sub_index) + '//link_assoc.txt'):
                                        
-            argsort_tp1 = np.argsort(-coverage[:this_GSEobj.Npt_tp1]+np.random.uniform(low=-0.5, high=0.5, size=this_GSEobj.Npt_tp1))
-            argsort_tp2 = this_GSEobj.Npt_tp1 + np.argsort(-coverage[this_GSEobj.Npt_tp1:]+np.random.uniform(low=-0.5, high=0.5, size=this_GSEobj.Npt_tp2))
+            argsort_tp1 = np.argsort(coverage[:this_GSEobj.Npt_tp1])
+            argsort_tp2 = this_GSEobj.Npt_tp1 + np.argsort(coverage[this_GSEobj.Npt_tp1:])
             incl_pts = np.zeros(this_GSEobj.Npts,dtype=np.bool_)
             
-            init_sample_1 = int(init_min_contig*(this_GSEobj.Npt_tp1/this_GSEobj.Npts))
-            init_sample_2 = int(init_min_contig*(this_GSEobj.Npt_tp2/this_GSEobj.Npts))
-            
+            if init_sample_1 is None:
+                init_sample_1 = int(init_min_contig*(this_GSEobj.Npt_tp1/this_GSEobj.Npts))
+                init_sample_2 = int(init_min_contig*(this_GSEobj.Npt_tp2/this_GSEobj.Npts))
+            else:
+                init_sample_1 = int(init_sample_1/1.1)
+                init_sample_2 = int(init_sample_2/1.1)
+
             while True: # continue in loop until sufficiently large contig reached
                 index_link_array = np.arange(this_GSEobj.Npts,dtype=np.int64)
                 incl_pts[argsort_tp1[:init_sample_1]] = True
@@ -1163,159 +1082,240 @@ def fast_GSE(this_GSEobj, params, sub_index, init_min_contig = 1000):
             # GENERATE GSE MATRIX
             os.mkdir(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) + '//')
             link_bool_vec = np.multiply(incl_pts[np.int64(this_GSEobj.link_data[:,0])],incl_pts[np.int64(this_GSEobj.link_data[:,1])])
-            np.savetxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) + '//link_assoc.txt', np.concatenate([2*np.ones([np.sum(link_bool_vec),1]), this_GSEobj.link_data[link_bool_vec,:]],axis=1),fmt='%i',delimiter=',')
+            np.savetxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) + '//link_assoc.txt', np.concatenate([2*np.ones([np.sum(link_bool_vec),1]), this_GSEobj.link_data[link_bool_vec,:]],axis=1),fmt='%i,%i,%i,%.10e',delimiter=',')
             del link_bool_vec
         
         print(str(sys.argv))
         my_argv = list(sys.argv)
         for i in range(len(my_argv)):
             if my_argv[i] == '-path':
-                my_argv[i+1] += 'subset_GSE' + str(sub_index) + '//'
-            elif my_argv[i] == '-init_min_contig':
+                my_argv[i+1] = sysOps.globaldatapath +  'subset_GSE' + str(sub_index) + '//'
+            elif my_argv[i] == '-init_min_contig' or my_argv[i] == '-calc_final':
                 my_argv[i] = str('')
                 my_argv[i+1] = str('')
         
         sysOps.throw_status("my_argv = " + " ".join(my_argv))
         sysOps.sh("python3 " + " ".join(my_argv))
-        
-def run_GSE(output_name, params):
-    
-    if type(params['-max_eig_cuts']) == list:
-        fill_params(params)
-    max_eig_cuts = int(params['-max_eig_cuts'])
-    inference_eignum = int(params['-inference_eignum'])
-    inference_dim = int(params['-inference_dim'])
-    GSE_iterations = int(params['-iterations'])
-    GSE_final_eigenbasis_size = int(params['-final_eignum'])
-    worker_processes = int(params['-ncpus'])
-    
-    num_subsets = int(params['-num_subsets'])
-    gamma = 0
-    sysOps.globaldatapath = str(params['-path'])
-    this_GSEobj = GSEobj(inference_dim,inference_eignum,gamma=gamma)
-    num_quantiles = 2
-    
-    sysOps.throw_status("params = " + str(params))
-    if '-init_min_contig' in params:
-        init_min_contig = int(params['-init_min_contig'])
-    else:
-        tmp_params = dict(params)
-        tmp_params['-path'] = sysOps.globaldatapath
-        tmp_params['-is_subset'] = True
-        full_gse('subGSEoutput.txt',tmp_params)
-        return
-    
-    if not sysOps.check_file_exists(output_name):
-        for sub_index in range(num_subsets):
-            
-            if not sysOps.check_file_exists('finalres'  + str(sub_index) + '.txt'):
-                fast_GSE(this_GSEobj, params, sub_index, init_min_contig = init_min_contig)
-                sub_index_key = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//index_key.txt',delimiter=',',dtype=np.int64)[:,1]
-                OBS = np.zeros([this_GSEobj.Npts,this_GSEobj.spat_dims],dtype=np.float64)
-                OBS[sub_index_key,:] = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//subGSEoutput.txt',delimiter=',',dtype=np.float64)[:,1:(1+this_GSEobj.spat_dims)]
-                sub_Npts = sub_index_key.shape[0]
-                rows = np.int64(np.concatenate([this_GSEobj.link_data[:,0], this_GSEobj.link_data[:,1]]))
-                cols = np.int64(np.concatenate([this_GSEobj.link_data[:,1], this_GSEobj.link_data[:,0]]))
-                
-                # determine degree adjacency from every point to current subset
-                degrees = np.zeros(this_GSEobj.Npts,dtype=np.int64)
-                degrees[sub_index_key] = 1
-                data = np.concatenate([this_GSEobj.link_data[:,2],this_GSEobj.link_data[:,2]])
-                csc_data = csc_matrix((data, (rows, cols)), (this_GSEobj.Npts, this_GSEobj.Npts))
-                current_degree = 2
-                sysOps.throw_status('Determining degrees')
-                while np.sum(degrees == 0) > 0:
-                    updated_degrees = csc_data.dot(degrees)
-                    new_connections = np.multiply(degrees == 0, updated_degrees > 0)
-                    degrees[new_connections] = current_degree
-                    current_degree += 1
-                sysOps.throw_status('Degrees range: ' + str([np.min(degrees),np.max(degrees)]))
-                
-                if sysOps.check_file_exists("coverage.npy"):
-                    coverage = np.load(sysOps.globaldatapath + "coverage.npy")
-                    coverage = np.minimum(coverage,degrees)
-                    np.save(sysOps.globaldatapath + "coverage.npy",coverage)
-                else:
-                    np.save(sysOps.globaldatapath + "coverage.npy",degrees)
-                
-                diag_mat = csc_matrix((np.power(csc_data.dot(np.ones(this_GSEobj.Npts,dtype=np.float64)),-1.0), (np.arange(this_GSEobj.Npts,dtype=np.int64), np.arange(this_GSEobj.Npts,dtype=np.int64))), (this_GSEobj.Npts, this_GSEobj.Npts))
-            
-                csc_data = diag_mat.dot(csc_data) #row-normalize
-                csc_data -= csc_matrix((np.ones(this_GSEobj.Npts,dtype=np.float64), (np.arange(this_GSEobj.Npts,dtype=np.int64), np.arange(this_GSEobj.Npts,dtype=np.int64))), (this_GSEobj.Npts, this_GSEobj.Npts))
-            
-                del diag_mat, data, rows, cols
-                TMP_RES = -csc_data.dot(OBS)
-                # for rows corresponding to points not included in above subset, TMP_RES now dictates the values to which RHS will be set equal to
-                # we can now reduce csc_data to a reduced square matrix
-                in_subset = np.zeros(this_GSEobj.Npts,dtype=np.bool_)
-                in_subset[sub_index_key] = True
-            
-                csc_data = csc_data.tocoo() # properties csc_data.data, csc_data.row, csc_data.col
-                use_el = np.multiply(~in_subset[csc_data.row],~in_subset[csc_data.col])
-                data = csc_data.data[use_el]
-                rows = csc_data.row[use_el]
-                cols = csc_data.col[use_el]
-            
-                nonsub_Npts = np.sum(~in_subset)
-                reduced_index_lookup = -np.ones(this_GSEobj.Npts,dtype=np.int64)
-                reduced_index_lookup[~in_subset] = np.arange(nonsub_Npts)
-                rows = reduced_index_lookup[rows]
-                cols = reduced_index_lookup[cols]
-                TMP_RES = TMP_RES[~in_subset,:]
-            
-                csc_data = csc_matrix((data, (rows, cols)), (nonsub_Npts, nonsub_Npts))
-                FINAL_RES = np.zeros([this_GSEobj.Npts,this_GSEobj.spat_dims],dtype=np.float64)
-                for d in range(this_GSEobj.spat_dims):
-                    sysOps.throw_status('Solving linear expression for dimension d=' + str(d) + ' for subset ' + str(sub_index))
-                    res,exit_code = scipy.sparse.linalg.cg(csc_data, TMP_RES[:,d],tol=1e-6)
-                    FINAL_RES[~in_subset,d] = res
-                    FINAL_RES[in_subset,d] = OBS[in_subset,d]
-                    
-                sysOps.throw_status('Done.')
-                status = np.zeros([this_GSEobj.Npts,1],dtype=np.int64)
-                status[in_subset] = 1
-                np.savetxt(sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt',np.concatenate([status,FINAL_RES],axis=1),delimiter=',',fmt='%i,' + ','.join(['%.10e']*this_GSEobj.spat_dims))
-        
-        if not sysOps.check_file_exists('evecs.npy'):
-            res_mat = list()
-            sysOps.throw_status('Loading results.')
-            for sub_index in range(num_subsets):
-                res_mat.append(np.loadtxt(sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt',delimiter=',',dtype=np.float64)[:,1:])
-            
-            sysOps.throw_status('Centering.')
-            res_mat = np.concatenate(res_mat,axis=1).T
-            for i in range(res_mat.shape[0]):
-                res_mat[i,:] -= np.mean(res_mat[i,:])
-            print(str(res_mat.shape))
-            U,S,Vh = LA.svd(res_mat, full_matrices = False)
-            print("S = " + str(S))
-            print(str(Vh.shape))
-            print(str(U.shape))
-            np.save(sysOps.globaldatapath + 'evecs.npy',Vh.T)
-            this_GSEobj.seq_evecs = Vh
-        else:
-            this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + 'evecs.npy').T
 
-        this_GSEobj.inference_eignum = this_GSEobj.seq_evecs.shape[0]
-        this_GSEobj.scale_boundaries = [this_GSEobj.inference_eignum]
-            
-        if not sysOps.check_file_exists('subsample_pairings.npy'):
-            subsample_pairings = 0
-            for sub_index in range(num_subsets):
-                sub_index_key = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//index_key.txt',delimiter=',',dtype=np.int64)[:,1]
-                tmp_subsample_pairings = np.load(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//subsample_pairings.npy')
-                subsample_pairings +=  csc_matrix((tmp_subsample_pairings[:,2], (sub_index_key[np.int64(tmp_subsample_pairings[:,0])], sub_index_key[np.int64(tmp_subsample_pairings[:,1])])), (this_GSEobj.Npts, this_GSEobj.Npts))
-                del tmp_subsample_pairings
-            subsample_pairings.sum_duplicates()
-            subsample_pairings = subsample_pairings.tocoo()
-            np.save(sysOps.globaldatapath +'subsample_pairings.npy',np.stack((subsample_pairings.row,subsample_pairings.col,subsample_pairings.data),axis=1))
-            del subsample_pairings
-            
-        spec_GSEobj(this_GSEobj, output_name)
-    get_clusters(this_GSEobj, output_name)
-    print_final_results(output_name,inference_dim) 
+    return init_sample_1, init_sample_2
+
+def proj_cg(Amat, bvec, l2reg, tol=1e-6, MAX_ITER=1000):
     
+    x,exit_code = scipy.sparse.linalg.cg(Amat, bvec,tol=tol,maxiter=MAX_ITER) # initiate x as non-regularized solution
+    x *= np.sqrt(l2reg)/LA.norm(x)
+    residual = np.subtract(bvec,Amat.dot(x))
+    if LA.norm(residual)/np.sqrt(l2reg) <= tol:
+        sysOps.throw_status('PCG converged without iteration.')
+        return x
+        
+    direction = residual
+    for iter in range(MAX_ITER):
+        proj_direction = Amat.dot(direction)
+        alpha = (LA.norm(residual)**2)/(direction.dot(proj_direction))
+        x += alpha*direction
+        x *= np.sqrt(l2reg)/LA.norm(x) # projection/regularization
+        new_residual = residual - alpha*proj_direction
+        
+        if LA.norm(new_residual)/np.sqrt(l2reg) <= tol:
+            sysOps.throw_status('PCG converged at iteration ' + str(iter))
+            return x
+        beta = (LA.norm(new_residual)**2)/(LA.norm(residual)**2)
+        direction = new_residual + beta*direction
+        residual = np.array(new_residual)
+                    
+    sysOps.throw_status('PCG returning at iteration ' + str(MAX_ITER))
+        
+    return x
+
+       
+@njit("void(float64[:,:],int64[:,:],float64[:,:],int64[:,:],float64[:,:],float64[:],int64[:],int64[:],float64[:,:],int64,int64,int64)",fastmath=True)
+def generate_sorted_dists(pos,nn_indices,nn_distances,nbr_indices,nbr_distances, distbuff,indexbuff,argsortbuff,posbuff,nn_num,Npts,spat_dims):
+    for n in range(Npts):
+        for i in range(nn_num*(2**spat_dims)):
+            indexbuff[i] = np.random.randint(Npts)
+        posbuff[0,:] = pos[n,:]
+        distbuff[:] = np.sqrt(np.sum(np.square(np.subtract(posbuff,pos[indexbuff,:])),axis=1))
+        distbuff[indexbuff == n] = np.max(distbuff)
+        argsortbuff[:] = np.argsort(distbuff[:])
+        nbr_indices[n,:] = indexbuff[argsortbuff[:nn_num]]
+        nbr_distances[n,:] = distbuff[argsortbuff[:nn_num]]
+    return
+
+def linear_interp_sub_solutions(this_GSEobj, params, num_subsets):
     
+    init_min_contig = int(params['-init_min_contig'])
+    init_sample_1 = None
+    init_sample_2 = None
+    
+    for sub_index in range(num_subsets):
+        
+        if not sysOps.check_file_exists('finalres'  + str(sub_index) + '.txt'):
+            init_sample_1, init_sample_2 = fast_GSE(this_GSEobj, params, sub_index, init_min_contig,init_sample_1,init_sample_2)
+            sub_index_key = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//index_key.txt',delimiter=',',dtype=np.int64)[:,1]
+            OBS = np.zeros([this_GSEobj.Npts,this_GSEobj.spat_dims],dtype=np.float64)
+            OBS[sub_index_key,:] = np.loadtxt(sysOps.globaldatapath + 'subset_GSE' + str(sub_index) +'//GSEoutput.txt',delimiter=',',dtype=np.float64)[:,1:(1+this_GSEobj.spat_dims)]
+            sub_Npts = sub_index_key.shape[0]
+            rows = np.int64(np.concatenate([this_GSEobj.link_data[:,0], this_GSEobj.link_data[:,1]]))
+            cols = np.int64(np.concatenate([this_GSEobj.link_data[:,1], this_GSEobj.link_data[:,0]]))
+                
+            data = np.concatenate([this_GSEobj.link_data[:,2],this_GSEobj.link_data[:,2]])
+            csc_data = csc_matrix((data, (rows, cols)), (this_GSEobj.Npts, this_GSEobj.Npts))
+            diag_mat = scipy.sparse.diags(np.power(csc_data.dot(np.ones(this_GSEobj.Npts,dtype=np.float64)),-1.0))
+        
+            csc_data = diag_mat.dot(csc_data) #row-normalize
+            
+            csc_data -= scipy.sparse.diags(np.ones(this_GSEobj.Npts,dtype=np.float64))
+        
+            del diag_mat, data, rows, cols
+            TMP_RES = -csc_data.dot(OBS)
+            # for rows corresponding to points not included in above subset, TMP_RES now dictates the values to which RHS will be set equal to
+            # we can now reduce csc_data to a reduced square matrix
+            in_subset = np.zeros(this_GSEobj.Npts,dtype=np.bool_)
+            in_subset[sub_index_key] = True
+        
+            csc_data = csc_data.tocoo() # properties csc_data.data, csc_data.row, csc_data.col
+            use_el = np.multiply(~in_subset[csc_data.row],~in_subset[csc_data.col])
+            data = csc_data.data[use_el]
+            rows = csc_data.row[use_el]
+            cols = csc_data.col[use_el]
+                    
+            nonsub_Npts = np.sum(~in_subset)
+            reduced_index_lookup = -np.ones(this_GSEobj.Npts,dtype=np.int64)
+            reduced_index_lookup[~in_subset] = np.arange(nonsub_Npts)
+            rows = reduced_index_lookup[rows]
+            cols = reduced_index_lookup[cols]
+            TMP_RES = TMP_RES[~in_subset,:]
+        
+            csc_data = csc_matrix((data, (rows, cols)), (nonsub_Npts, nonsub_Npts))
+            FINAL_RES = np.zeros([this_GSEobj.Npts,this_GSEobj.spat_dims],dtype=np.float64)
+            for d in range(this_GSEobj.spat_dims):
+                sysOps.throw_status('Solving linear expression for dimension d=' + str(d) + ' for subset ' + str(sub_index))
+                res = proj_cg(csc_data, TMP_RES[:,d], l2reg = np.var(OBS[sub_index_key,d])*nonsub_Npts, tol=1e-6, MAX_ITER=1000)
+                FINAL_RES[~in_subset,d] = res
+                FINAL_RES[in_subset,d] = OBS[in_subset,d]
+                
+            sysOps.throw_status('Done.')
+            status = np.zeros([this_GSEobj.Npts,1],dtype=np.int64)
+            status[in_subset] = 1
+            np.savetxt(sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt',np.concatenate([status,FINAL_RES],axis=1),delimiter=',',fmt='%i,' + ','.join(['%.10e']*this_GSEobj.spat_dims))
+                                                    
+            # update coverage
+            
+            if sysOps.check_file_exists("coverage.npy"):
+                coverage = np.load(sysOps.globaldatapath + "coverage.npy")
+            else:
+                coverage = np.zeros(this_GSEobj.Npts,dtype=np.float64)
+            coverage[in_subset] += 1
+            
+            np.save(sysOps.globaldatapath + "coverage.npy",coverage)
+            
+    return
+    
+def calculate_eiggaps(nn_indices, FINAL_res):
+    eigtotvar = np.zeros(nn_indices.shape[0],dtype=np.float64)
+    for i, neighbors in enumerate(nn_indices):
+        neighbor_positions = FINAL_res[neighbors]
+        cov_matrix = np.cov(neighbor_positions, rowvar=False)
+        eigtotvar[i] = np.trace(cov_matrix)
+    return eigtotvar
+
+def get_dispersions(this_GSEobj,FINAL_RES):
+    sqdists = np.zeros(this_GSEobj.link_data.shape[0],dtype=np.float64)
+    sumsq = np.zeros(this_GSEobj.Npts,dtype=np.float64)
+    sumweights = np.zeros(this_GSEobj.Npts,dtype=np.float64)
+    sum_links = np.add(np.histogram(this_GSEobj.link_data[:,0],bins=np.arange(this_GSEobj.Npts+1),weights=this_GSEobj.link_data[:,2])[0], np.histogram(this_GSEobj.link_data[:,1],bins=np.arange(this_GSEobj.Npts+1),weights=this_GSEobj.link_data[:,2])[0])
+
+    nbrs = NearestNeighbors(n_neighbors=10*this_GSEobj.spat_dims+1).fit(FINAL_RES)
+    nn_distances, nn_indices = nbrs.kneighbors(FINAL_RES)
+    eigtotvar = calculate_eiggaps(nn_indices, FINAL_RES)
+    
+    for i in range(this_GSEobj.link_data.shape[0]):
+        umi1 = int(this_GSEobj.link_data[i,0])
+        umi2 = int(this_GSEobj.link_data[i,1])
+        sqdist = LA.norm(FINAL_RES[umi1,:]-FINAL_RES[umi2,:])**2
+        sumsq[umi1] += (this_GSEobj.link_data[i,2]/sum_links[umi2])*sqdist
+        sumsq[umi2] += (this_GSEobj.link_data[i,2]/sum_links[umi1])*sqdist 
+    return np.sqrt(sumsq/eigtotvar)
+
+def filter_data(this_GSEobj, num_subsets, newdir, retention_fraction):
+
+    min_links = 2
+    eiggaps = list()
+    rms_dist_ratios = list()
+    for sub_index in range(num_subsets):
+        sysOps.throw_status('Loading ' + sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt')
+        FINAL_RES = np.loadtxt(sysOps.globaldatapath + 'finalres' + str(sub_index) + '.txt',delimiter=',',dtype=np.float64)
+        FINAL_RES = FINAL_RES[:,1:]
+        my_rms = get_dispersions(this_GSEobj,FINAL_RES)
+        rms_dist_ratios.append(np.array(my_rms).reshape([this_GSEobj.Npts,1]))
+        eiggaps.append(np.array(my_rms).reshape([this_GSEobj.Npts,1]))
+        del FINAL_RES
+            
+    # rank by mean distances
+    rms_dist_ratios = np.min(np.concatenate(rms_dist_ratios,axis=1),axis=1)
+    np.save(sysOps.globaldatapath + "rms_dists.npy",rms_dist_ratios)
+    incl_pts = np.zeros(this_GSEobj.Npts,dtype=np.bool_)
+    incl_pts[np.argsort(-np.min(np.concatenate(eiggaps,axis=1),axis=1))[:int(retention_fraction*this_GSEobj.Npts)]] = True
+    
+    assoc_inclusion_arr = np.ones(this_GSEobj.link_data.shape[0],dtype=np.bool_)
+    
+    reduced_link_array = this_GSEobj.link_data[np.multiply(incl_pts[np.int64(this_GSEobj.link_data[:,0])], incl_pts[np.int64(this_GSEobj.link_data[:,1])]),:]
+                                
+    while True:
+        sum_links = np.add(np.histogram(reduced_link_array[:,0],bins=np.arange(this_GSEobj.Npts+1),weights=reduced_link_array[:,2])[0], np.histogram(reduced_link_array[:,1],bins=np.arange(this_GSEobj.Npts+1),weights=reduced_link_array[:,2])[0]) # tallies number of unique associations per point
+        if np.sum(sum_links[incl_pts] >= min_links) + np.sum(sum_links[incl_pts] >= min_links) == 0:
+            break
+        
+        tot_remove_links = np.sum(np.multiply(incl_pts,sum_links<min_links))
+        sysOps.throw_status('Removing ' + str(tot_remove_links) + ' associations.')
+        if tot_remove_links == 0:
+            break
+            
+        incl_pts = np.multiply(incl_pts,sum_links>=min_links)
+        reduced_link_array = reduced_link_array[np.multiply(incl_pts[np.int64(reduced_link_array[:,0])], incl_pts[np.int64(reduced_link_array[:,1])]),:]
+                    
+    index_link_array = np.arange(this_GSEobj.Npts,dtype=np.int64)
+    groupings = np.arange(this_GSEobj.Npts,dtype=np.int64)
+    groupings[incl_pts] = this_GSEobj.Npts
+    min_contig_edges(index_link_array, groupings, this_GSEobj.link_data, this_GSEobj.link_data.shape[0])
+    argsorted_index_link_array = np.argsort(index_link_array)
+    index_starts = np.append(np.append(0,1+np.where(np.diff(index_link_array[argsorted_index_link_array])>0)[0]), this_GSEobj.Npts)
+    contig_sizes = np.diff(index_starts)
+    argmax_contig = np.argmax(contig_sizes)
+    sysOps.throw_status('Found max contig ' + str(contig_sizes[argmax_contig]))
+    link_bool_vec = np.multiply(incl_pts[np.int64(this_GSEobj.link_data[:,0])],incl_pts[np.int64(this_GSEobj.link_data[:,1])])
+    np.savetxt(newdir + '//link_assoc.txt', np.concatenate([2*np.ones([np.sum(link_bool_vec),1]), this_GSEobj.link_data[link_bool_vec,:]],axis=1),fmt='%i',delimiter=',')
+    del link_bool_vec
+    
+def print_knn_overlap(index_filename = 'sorted_tmp_nn_indices.txt', output_filename = 'sorted_tmp_nn_overlap.txt'):
+    # Load the index data
+    sysOps.throw_status('Calling print_knn_overlap() on ' + index_filename)
+    indices = np.loadtxt(index_filename, delimiter=',', dtype=np.int32)
+
+    n_points = indices.shape[0]
+
+    rows = np.int32(np.outer(np.arange(n_points), np.ones(indices.shape[1]))).reshape(-1)
+    cols = indices.reshape(-1)
+    col_pos = np.int32(np.outer(np.ones(n_points), np.arange(indices.shape[1]))).reshape(-1)
+    data = np.ones(rows.shape,dtype=np.int32)
+    binary_matrix = csc_matrix((data, (rows, cols)), shape=(n_points, n_points))
+    binary_matrix_col_pos_plus_1 = csc_matrix((col_pos+1, (rows, cols)), shape=(n_points, n_points))
+
+    result = binary_matrix.multiply(binary_matrix.transpose()).tocsr()
+    binary_matrix_col_pos_plus_1 = binary_matrix_col_pos_plus_1.multiply(result).tocsr()
+    reshaped_result = np.zeros(indices.shape, dtype=np.int32)
+
+    for row in range(n_points):
+        start_idx = result.indptr[row]
+        end_idx = result.indptr[row + 1]
+        reshaped_result[row, -1 + binary_matrix_col_pos_plus_1.data[binary_matrix_col_pos_plus_1.indptr[row]:binary_matrix_col_pos_plus_1.indptr[row + 1]]] = result.data[start_idx:end_idx]
+
+    overlap_fraction = np.sum(reshaped_result > 0) / np.prod(reshaped_result.shape)
+    
+    sysOps.throw_status('Printing ' + str(overlap_fraction) + ' overlap-fraction.')
+    # Save the result to a new text file
+    np.savetxt(output_filename, reshaped_result, fmt='%i', delimiter=',')
+
 def full_gse(output_name, params):
     # Primary function call for image inference and segmentation
     # Inputs:
@@ -1324,16 +1324,14 @@ def full_gse(output_name, params):
     
     # Initiating the amplification factors involves examining the solution when all positions are equal
     # This gives, for pts k: n_{k\cdot} = \frac{n_{\cdot\cdot}}{(\sum_{i\neq k} e^{A_i})(\sum_j e^{A_j})/(e^{A_k}(\sum_j e^{A_j})) + 1}
-    
-    if type(params['-max_eig_cuts']) == list:
+        
+    if type(params['-max_rand_tessellations']) == list:
         fill_params(params)
-    max_eig_cuts = int(params['-max_eig_cuts'])
+    max_rand_tessellations = int(params['-max_rand_tessellations'])
     inference_eignum = int(params['-inference_eignum'])
     inference_dim = int(params['-inference_dim'])
-    GSE_iterations = int(params['-iterations'])
     GSE_final_eigenbasis_size = int(params['-final_eignum'])
     worker_processes = int(params['-ncpus'])
-    gamma = 0 #float(params['-gamma'])
     sysOps.globaldatapath = str(params['-path'])
     
     try:
@@ -1344,31 +1342,38 @@ def full_gse(output_name, params):
     num_quantiles = 2
     this_GSEobj = None
     if ('-is_subset' in params and params['-is_subset']) and (output_name is None or not sysOps.check_file_exists(output_name)):
-        for GSE_iteration in range(GSE_iterations):
-            sysOps.throw_status("Beginning GSE iteration " + str(GSE_iteration+1) + "/" + str(GSE_iterations))
-            this_GSEobj = GSEobj(inference_dim,inference_eignum,gamma=gamma)
-            this_GSEobj.num_workers = worker_processes
-            if not sysOps.check_file_exists("orig_evecs_gapnorm.npy"):
-                sysOps.throw_status('Running sGSEobj. Initiating with (inference_dim, inference_eignum) = ' + str([inference_dim, inference_eignum]))
-                #this_GSEobj.reduce_to_largest_linkage_cluster()
-                if not sysOps.check_file_exists("evecs.npy"):
-                    this_GSEobj.eigen_decomp(orth=True,print_evecs=False)
+        this_GSEobj = GSEobj(inference_dim,inference_eignum)
+        this_GSEobj.num_workers = worker_processes
+        if not sysOps.check_file_exists("orig_evecs_gapnorm.npy"):
+            sysOps.throw_status('Running sGSEobj. Initiating with (inference_dim, inference_eignum) = ' + str([inference_dim, inference_eignum]))
+            #this_GSEobj.reduce_to_largest_linkage_cluster()
+            if not sysOps.check_file_exists("evecs.npy"):
+                if this_GSEobj.seq_evecs is not None:
+                    del this_GSEobj.seq_evecs
+                    this_GSEobj.seq_evecs = None
+                if sysOps.check_file_exists("preorthbasis.npy"):
+                    this_GSEobj.eigen_decomp(orth=False,print_evecs=False,krylov_approx="preorthbasis.npy")
                 else:
-                    this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "evecs.npy").T
-                
-                print('this_GSEobj.seq_evecs.shape = ' + str(this_GSEobj.seq_evecs.shape))
-                for i in range(this_GSEobj.seq_evecs.shape[0]):
-                    divisor = np.max(np.diff(np.sort(this_GSEobj.seq_evecs[i,:])))
-                    if divisor > 0: # in rare occasions this will not be true, in which case do not rescale eigenvector
-                        this_GSEobj.seq_evecs[i,:] /= divisor
-                        
-                np.save(sysOps.globaldatapath + "orig_evecs_gapnorm.npy",this_GSEobj.seq_evecs.T)
-                if sysOps.check_file_exists("evecs.npy"):
-                    os.remove(sysOps.globaldatapath + "evecs.npy")
+                    this_GSEobj.eigen_decomp(orth=False,print_evecs=False)
             else:
-                this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "orig_evecs_gapnorm.npy").T
-            
-            
+                this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "evecs.npy").T
+                                
+            np.save(sysOps.globaldatapath + "preorthbasis.npy",this_GSEobj.seq_evecs.T)
+            print('this_GSEobj.seq_evecs.shape = ' + str(this_GSEobj.seq_evecs.shape))
+            sum_links = np.add(this_GSEobj.sum_pt_tp1_link,this_GSEobj.sum_pt_tp2_link)
+            for i in range(this_GSEobj.seq_evecs.shape[0]):
+                max_gap = np.median(np.diff(np.sort(this_GSEobj.seq_evecs[i,:])))/(1+this_GSEobj.seq_evals[i])
+                if max_gap > 0: # in rare occasions this will not be true, in which case do not rescale eigenvector
+                    this_GSEobj.seq_evecs[i,:] /= max_gap
+                    
+            np.save(sysOps.globaldatapath + "orig_evecs_gapnorm.npy",this_GSEobj.seq_evecs.T)
+            if sysOps.check_file_exists("evecs.npy"):
+                os.remove(sysOps.globaldatapath + "evecs.npy")
+        else:
+            this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "orig_evecs_gapnorm.npy").T
+        
+        
+        if not sysOps.check_file_exists("nbr_indices.npy"):
             process_list = list()
             for proc_ind in range(this_GSEobj.num_workers): # set up worker processes
                 sysOps.throw_status('Initiating process ' + str(proc_ind))
@@ -1378,177 +1383,169 @@ def full_gse(output_name, params):
             #################      GSE processes begin here      #################
             ######################################################################
             
-            this_GSEobj.move_to_shared_memory(divdirs=[])
-            if not sysOps.check_file_exists("nbr_indices_0.txt") and not sysOps.check_file_exists("nbr_indices_0.npy"):
-            
-                if not sysOps.check_file_exists('nn_indices_0.txt') and (not sysOps.check_file_exists("div1//manifold_vecs.txt")) and (not sysOps.check_file_exists("div1//nbr_indices_1.txt")):
-                    # execute segmentation/manifold-slicing
-                                            
-                    this_GSEobj.deliver_handshakes('slice',np.array([eig_cut for eig_cut in range(1,max_eig_cuts+1) if not sysOps.check_file_exists("div" + str(eig_cut) + "//link_assoc_stats.txt")]),None,np.arange(0,this_GSEobj.num_workers,dtype=np.int64),max_simultaneous_div=this_GSEobj.num_workers,root_delete=True)
-                                
-                    for eig_cut in range(1,max_eig_cuts+1): # for the following steps in GSE, we deal with eig_cut's one at a time to avoid lags in re-loading the same data to memory
-                        
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//sorted_collated_Xpts.txt"):
-                                
-                            # get segment counts for each segment by checking on directories
-                            
-                            seg_count = len([dirname for dirname in sysOps.sh("ls -d " + sysOps.globaldatapath + "div" + str(eig_cut) + "//seg*").strip('\n').split("\n") if "seg" in dirname])
-                                                    
-                            with open(sysOps.globaldatapath + "div" + str(eig_cut) + "//max_segment_index.txt",'w') as outfile:
-                                outfile.write(str(seg_count-1))
-                            if not sysOps.check_file_exists("div" + str(eig_cut) + "//seg0//evecs.npy"):
-                                this_GSEobj.deliver_handshakes('eigs',np.array([eig_cut]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
-                            else:
-                                sysOps.throw_status('Segment eigenvectors found pre-calculated in div' + str(eig_cut) + '//')
-                            
-                            this_GSEobj.deliver_handshakes('seg_orth',np.array([eig_cut]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
-                            # collating will involve only 1 process per cut
-                            this_GSEobj.deliver_handshakes('collate',np.array([eig_cut]),None,np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
-                        else:
-                            if not sysOps.check_file_exists("div" + str(eig_cut) + "//max_segment_index.txt"):
-                                max_segment_index = int(np.max(np.loadtxt(sysOps.globaldatapath + "div" + str(eig_cut) + "//sorted_collated_Xpts.txt",delimiter=',',dtype=np.float64)[:,0]))-1 # can be removed once all data sets are updated, no effect otherwise
-                                with open(sysOps.globaldatapath + "div" + str(eig_cut) + "//max_segment_index.txt",'w') as outfile:
-                                    outfile.write(str(max_segment_index))
-                            seg_count = int(np.loadtxt(sysOps.globaldatapath + "div" + str(eig_cut) +  '//max_segment_index.txt',dtype=np.int64))+1
-                            sysOps.throw_status('Collated data found pre-calculated in div' + str(eig_cut) + '//')
-                                        
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//nn_indices0.txt"):
-                            this_GSEobj.deliver_handshakes('knn',np.array([eig_cut]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=True)
-                        else:
-                            sysOps.throw_status('knn solutions found in div' + str(eig_cut) + '//')
+            this_GSEobj.move_to_shared_memory(tessdirs=[])
+        
+        if max_rand_tessellations == 0:
+            tess_range = [0]
+        else:
+            tess_range = range(1,max_rand_tessellations+1)
+                
+        DEFAULT_TOT_SOURCES = (2*this_GSEobj.inference_eignum)*(2**this_GSEobj.spat_dims)
+        
+        if (not sysOps.check_file_exists("nbr_indices_0.txt") and not sysOps.check_file_exists("nbr_indices_0.npy") and not sysOps.check_file_exists("nbr_indices.npy")) and not sysOps.check_file_exists("subsample_pairings_0.npz"):
+        
+            if not sysOps.check_file_exists('nn_indices_0.txt') and (not sysOps.check_file_exists("tess1//nbr_indices_1.txt")):
                                                         
-                    for eig_cut in range(1,max_eig_cuts+1):
-                        divpath = sysOps.globaldatapath + "div" + str(eig_cut) + "//"
-                        sysOps.sh("sort -T " + divpath + "tmp -m -k1n,1 -t \",\" " + divpath + "nn_indices*.txt > " + divpath + "sorted_tmp_nn_indices.txt")
-                        # perform check that all indices are present
-                        bad_indices = int(sysOps.sh("awk -F, 'BEGIN{bad_indices=0;}{if($1!=NR-1){bad_indices++;}}END{print bad_indices;}' " + divpath + "sorted_tmp_nn_indices.txt").strip('n'))
-                        if bad_indices > 0:
-                            sysOps.throw_status("Error: found " + str(bad_indices) + " bad indices in file " + divpath + "sorted_tmp_nn_indices.txt")
-                            sysOps.exitProgram()
-                        sysOps.sh("rm " + divpath + "nn_indices*.txt")
-                        sysOps.sh("split -a 5 -d -l 10000 " + divpath + "sorted_tmp_nn_indices.txt " + divpath + "tmp_nn_splitfile-")
-                        os.remove(divpath + "sorted_tmp_nn_indices.txt")
-            
-                    [dirnames,filenames] = sysOps.get_directory_and_file_list(sysOps.globaldatapath + "div1//") # all split files will be the same between division directories
-                    nn_file_index = 0
-                    for filename in sorted(filenames): # alphabetic enumeration
-                        if filename.startswith("tmp_nn_splitfile"):
-                            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//" + filename for eig_cut in range(1,max_eig_cuts+1)]) + " > " + sysOps.globaldatapath + "nn_indices_" + str(nn_file_index) + ".txt")
-                            nn_file_index += 1
-                    sysOps.sh("rm " + sysOps.globaldatapath + "div*/tmp_nn_splitfile*")
                 
-                for eig_cut in range(1,max_eig_cuts+1): # for the following steps in GSE, we deal with eig_cut's one at a time to avoid lags in re-loading the same data to memory
-                    if not sysOps.check_file_exists("div" + str(eig_cut) + "//max_nbr_indices.txt"):
+                if max_rand_tessellations == 0:
+                    os.mkdir(this_GSEobj.path + 'tess0')
+                    os.mkdir(this_GSEobj.path + 'tess0/tmp')
+                    sysOps.sh('cp -p ' + this_GSEobj.path + '/link_assoc_stats.txt ' + this_GSEobj.path + 'tess0/link_assoc_stats.txt')
+                else:
+                    this_GSEobj.deliver_handshakes('tesselate',np.array([tesselation for tesselation in range(1,max_rand_tessellations+1) if not sysOps.check_file_exists("tess" + str(tesselation) + "//reindexed_Xpts_segment_None.txt")]),None,np.arange(0,this_GSEobj.num_workers,dtype=np.int64),max_simultaneous_tess=this_GSEobj.num_workers,root_delete=True)
                     
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//max_segment_index.txt"):
-                            max_segment_index = int(np.max(np.loadtxt(sysOps.globaldatapath + "div" + str(eig_cut) + "//sorted_collated_Xpts.txt",delimiter=',',dtype=np.float64)[:,0]))-1 # can be removed once all data sets are updated, no effect otherwise
-                            with open(sysOps.globaldatapath + "div" + str(eig_cut) + "//max_segment_index.txt",'w') as outfile:
-                                outfile.write(str(max_segment_index))
-                
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//manifold_vecs.txt"):
-                            this_GSEobj.deliver_handshakes('manifold',np.array([eig_cut]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),merge_prefixes=['nn_indices','manifold_vecs','manifold_coldims'],root_delete=False)
-                        else:
-                            sysOps.throw_status('Manifolds found pre-calculated in div' + str(eig_cut) + '//')
-
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//ellipsoid_mats.txt"):
-                            this_GSEobj.deliver_handshakes('ellipsoid',np.array([eig_cut]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),merge_prefixes=['ellipsoid_mats'],root_delete=False,set_weights=np.add(this_GSEobj.sum_pt_tp1_link,this_GSEobj.sum_pt_tp2_link))
+                for tesselation in tess_range: # for the following steps in GSE, we deal with tesselation's one at a time to avoid lags in re-loading the same data to memory
+                                            
+                    # get segment counts for each segment by checking on directories
+                    seg_count = int(np.loadtxt(sysOps.globaldatapath + "tess" + str(tesselation) +  '//max_segment_index.txt',dtype=np.int64))+1
+                    if not sysOps.check_file_exists("tess" + str(tesselation) + "//sorted_collated_Xpts.txt"):
                             
+                        if seg_count > 0 and (not sysOps.check_file_exists("tess" + str(tesselation) + "//seg0//evecs.npy")):
+                            this_GSEobj.deliver_handshakes('eigs',np.array([tesselation]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
                         else:
-                            sysOps.throw_status('Ellipsoids found pre-calculated in div' + str(eig_cut) + '//')
-
-                        if not sysOps.check_file_exists("div" + str(eig_cut) + "//inv_ellipsoid_mats.txt"):
-                            this_GSEobj.deliver_handshakes('smooth_ellipsoid',np.array([eig_cut]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),merge_prefixes=['inv_ellipsoid_mats'],root_delete=False)
-                        else:
-                            sysOps.throw_status('Inverse-ellipsoids found pre-calculated in div' + str(eig_cut) + '//')
-                                    
-                        this_GSEobj.deliver_handshakes('quantiles',np.array([eig_cut]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64), merge_prefixes=["lengthscales","max_nbr_distances","max_nbr_err_distances","max_nbr_indices","nbr_distances_0","nbr_indices_0","nbr_distances_1","nbr_err_distances_1","nbr_indices_1"],root_delete=True,set_weights=None)
+                            sysOps.throw_status('Segment eigenvectors found pre-calculated in tess' + str(tesselation) + '//')
+                        
+                        if seg_count > 0:
+                            this_GSEobj.deliver_handshakes('seg_orth',np.array([tesselation]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
+                        # collating will involve only 1 process per cut
+                        this_GSEobj.deliver_handshakes('collate',np.array([tesselation]),None,np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=False)
                     else:
-                        sysOps.throw_status('Quantiles found pre-calculated in div' + str(eig_cut) + '//')
-                            
-                ######################################################################
-                ##############      GSE sliced-processes complete      ###############
-                ######################################################################
+                        sysOps.throw_status('Collated data found pre-calculated in tess' + str(tesselation) + '//')
+                                    
+                    if not sysOps.check_file_exists("tess" + str(tesselation) + "//nn_indices0.txt"):
+                        if max_rand_tessellations == 0:
+                            this_GSEobj.deliver_handshakes('knn',np.array([0]),np.array([seg_count]),np.arange(0,1,dtype=np.int64),root_delete=True)
+                        else:
+                            this_GSEobj.deliver_handshakes('knn',np.array([tesselation]),np.array([seg_count]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64),root_delete=True)
+                    else:
+                        sysOps.throw_status('knn solutions found in tess' + str(tesselation) + '//')
                 
-                for div_index in range(max_eig_cuts+1):
-                    this_GSEobj.unload_shared_data_from_lists(div_index)
+                if max_rand_tessellations > 0:
+                    for tesselation in range(1,max_rand_tessellations+1):
+                        tesspath = sysOps.globaldatapath + "tess" + str(tesselation) + "//"
+                        sysOps.sh("sort -T " + tesspath + "tmp -m -k1n,1 -t \",\" " + tesspath + "nn_indices*.txt > " + tesspath + "sorted_tmp_nn.txt")
+                        # perform check that all indices are present
+                        bad_indices = int(sysOps.sh("awk -F, 'BEGIN{bad_indices=0;}{if($1!=NR-1){bad_indices++;}}END{print bad_indices;}' " + tesspath + "sorted_tmp_nn.txt").strip('n'))
+                        if bad_indices > 0:
+                            sysOps.throw_status("Error: found " + str(bad_indices) + " bad indices in file " + tesspath + "sorted_tmp_nn.txt")
+                            sysOps.exitProgram()
+                        sysOps.sh("rm " + tesspath + "nn_indices*.txt")
+                        # split indices back into indices and distances
+                        num_nn = int((sysOps.sh("head -1 " + tesspath + "sorted_tmp_nn.txt").strip('\n').count(',')+1)/2)-1
+                        sysOps.sh("awk -F, '{print " + " \",\" ".join(["$" + str(i+1) for i in range(1,num_nn+1)]) + " > \"" + tesspath + "sorted_tmp_nn_indices.txt\"; print " + " \",\" ".join(["$" + str(i+1) for i in range(num_nn+2,2*(num_nn+1))]) + " > \"" + tesspath + "sorted_tmp_nn_distances.txt\";}' " + tesspath + "sorted_tmp_nn.txt") # remove first element (self)
                         
-                for q in range(num_quantiles):
-                    prefix = ""
-                    sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//" + prefix + "nbr_distances_" + str(q) + ".txt" for eig_cut in range(1,max_eig_cuts+1)])
-                              + " > " + sysOps.globaldatapath + prefix + "nbr_distances_" + str(q) + ".txt")
-                    sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//" + prefix + "nbr_indices_" + str(q) + ".txt" for eig_cut in range(1,max_eig_cuts+1)])
-                              + " > " + sysOps.globaldatapath + prefix + "nbr_indices_" + str(q) + ".txt")
-                    if q > 0:
-                        sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//" + prefix + "nbr_err_distances_" + str(q) + ".txt" for eig_cut in range(1,max_eig_cuts+1)])
-                                  + " > " + sysOps.globaldatapath + prefix + "nbr_err_distances_" + str(q) + ".txt")
-                
-                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//lengthscales.txt" for eig_cut in range(1,max_eig_cuts+1)]) + " > " + sysOps.globaldatapath + "lengthscales.txt")
-                
-                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//max_nbr_distances.txt" for eig_cut in range(1,max_eig_cuts+1)])
-                          + " > " + sysOps.globaldatapath + "max_nbr_distances.txt")
-                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//max_nbr_err_distances.txt" for eig_cut in range(1,max_eig_cuts+1)])
-                          + " > " + sysOps.globaldatapath + "max_nbr_err_distances.txt")
-                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "div" + str(eig_cut) + "//max_nbr_indices.txt" for eig_cut in range(1,max_eig_cuts+1)])
-                          + " > " + sysOps.globaldatapath + "max_nbr_indices.txt")
-                try:
-                    sysOps.sh("rm -r " + sysOps.globaldatapath + "div*")
-                except:
-                    pass
-                          
-                sysOps.throw_status('Filtering error values.')
-                indexfile = np.loadtxt(sysOps.globaldatapath + "max_nbr_indices.txt",dtype=np.int64,delimiter=',')
-                distfile = np.loadtxt(sysOps.globaldatapath + "max_nbr_distances.txt",dtype=np.float64,delimiter=',')
-                disterrfile = np.loadtxt(sysOps.globaldatapath + "max_nbr_err_distances.txt",dtype=np.float64,delimiter=',')
-                index_argsort_buff = -np.ones(indexfile.shape[1],dtype=np.int64)
-                newrow_buff = -np.ones(indexfile.shape[1],dtype=np.float64)
-                source_divs = -np.ones(indexfile.shape,dtype=np.int64)
-                max_incl = int(newrow_buff.shape[0]/2)
-                
-                div_lookup = np.concatenate([np.array([eig_cut]*int(distfile.shape[1]/max_eig_cuts),dtype=np.int64) for eig_cut in range(max_eig_cuts+1)]) # assign division index for each column of nbr input
-                filter_errvals(indexfile,distfile,disterrfile,source_divs,index_argsort_buff,newrow_buff,max_incl,distfile.shape[0],distfile.shape[1],False)
-                np.save(sysOps.globaldatapath + "max_nbr_indices.npy",indexfile[:,:max_incl])
-                np.save(sysOps.globaldatapath + "max_nbr_distances.npy",distfile[:,:max_incl])
-                sysOps.sh("rm " + sysOps.globaldatapath + "max_nbr*.txt")
+                        print_knn_overlap(index_filename = tesspath + 'sorted_tmp_nn_indices.txt', output_filename = tesspath + 'sorted_tmp_nn_overlap.txt')
                         
-                indexfile = np.loadtxt(sysOps.globaldatapath + "nbr_indices_1.txt",dtype=np.int64,delimiter=',')
-                distfile = np.loadtxt(sysOps.globaldatapath + "nbr_distances_1.txt",dtype=np.float64,delimiter=',')
-                disterrfile = np.loadtxt(sysOps.globaldatapath + "nbr_err_distances_1.txt",dtype=np.float64,delimiter=',')
-                source_divs[:] = -1
-                div_lookup = np.concatenate([np.array([eig_cut]*int(distfile.shape[1]/max_eig_cuts),dtype=np.int64) for eig_cut in range(max_eig_cuts+1)]) # assign division index for each column of nbr input
-                filter_errvals(indexfile,distfile,disterrfile,source_divs,index_argsort_buff,newrow_buff,max_incl,distfile.shape[0],distfile.shape[1],False)
-                np.save(sysOps.globaldatapath + "nbr_indices_1.npy",indexfile[:,:max_incl])
-                np.save(sysOps.globaldatapath + "nbr_distances_1.npy",distfile[:,:max_incl])
-                sysOps.sh("rm " + sysOps.globaldatapath + "nbr_*_1.txt")
-                                
-                indexfile = np.loadtxt(sysOps.globaldatapath + "nbr_indices_0.txt",dtype=np.int64,delimiter=',')
-                distfile = np.loadtxt(sysOps.globaldatapath + "nbr_distances_0.txt",dtype=np.float64,delimiter=',')
-                disterrfile = np.array(distfile) # minimize just the distances here
-                source_divs[:] = -1
-                div_lookup = np.concatenate([np.array([eig_cut]*int(distfile.shape[1]/max_eig_cuts),dtype=np.int64) for eig_cut in range(max_eig_cuts+1)]) # assign division index for each column of nbr input
-                filter_errvals(indexfile,distfile,disterrfile,source_divs,index_argsort_buff,newrow_buff,max_incl,distfile.shape[0],distfile.shape[1],True)
-                np.save(sysOps.globaldatapath + "nbr_indices_0.npy",indexfile[:,:max_incl])
-                np.save(sysOps.globaldatapath + "nbr_distances_0.npy",distfile[:,:max_incl])
-                sysOps.sh("rm " + sysOps.globaldatapath + "nbr_*_0.txt")
-                
-                # merge index and distance files
-                merged_index_file = np.zeros([indexfile.shape[0],max_incl,3],dtype=np.int64)
-                merged_dist_file = np.zeros([indexfile.shape[0],max_incl,2],dtype=np.float64)
-                merged_index_file[:,:,0] = indexfile[:,:max_incl]
-                merged_dist_file[:,:,0] = distfile[:,:max_incl]
-                del indexfile, distfile, disterrfile, source_divs
-                merged_index_file[:,:,1] = np.load(sysOps.globaldatapath + "nbr_indices_1.npy")
-                merged_dist_file[:,:,1] = np.load(sysOps.globaldatapath + "nbr_distances_1.npy")
-                merged_index_file[:,:,2] = np.load(sysOps.globaldatapath + "max_nbr_indices.npy")
-                np.save(sysOps.globaldatapath + "nbr_indices.npy",merged_index_file)
-                np.save(sysOps.globaldatapath + "nbr_distances.npy",merged_dist_file)
-                
-                sysOps.throw_status('Done.')
+                        sysOps.sh("split -a 5 -d -l 10000 " + tesspath + "sorted_tmp_nn_indices.txt " + tesspath + "tmp_nn_indices_splitfile-")
+                        sysOps.sh("split -a 5 -d -l 10000 " + tesspath + "sorted_tmp_nn_distances.txt " + tesspath + "tmp_nn_distances_splitfile-")
+                        sysOps.sh("split -a 5 -d -l 10000 " + tesspath + "sorted_tmp_nn_overlap.txt " + tesspath + "tmp_nn_overlap_splitfile-")
+                        sysOps.sh("rm " + tesspath + "sorted_tmp_nn*.txt")
             
-            if (GSE_iteration == GSE_iterations-1) and (not sysOps.check_file_exists('subsample_pairings.npy')):
-                print_subsample_pts(this_GSEobj,"nbr_indices.npy","nbr_distances.npy",print_bipartite = False)
+                    [dirnames,filenames] = sysOps.get_directory_and_file_list(sysOps.globaldatapath + "tess1//") # all split files will be the same between tessellation directories
+                    
+                    for filename in sorted(filenames): # alphabetic enumeration: split -a 5 -d -l 10000 will guarantee ordering can be done lexicographically
+                        if filename.startswith("tmp_nn_indices_splitfile-"):
+                            nn_file_index = int(filename[len("tmp_nn_indices_splitfile-"):]) # get index, remove 0-padding
+                            distance_filename = "tmp_nn_distances_splitfile-" + filename[len("tmp_nn_indices_splitfile-"):] # get corresponding distance filename
+                            overlap_filename = "tmp_nn_overlap_splitfile-" + filename[len("tmp_nn_indices_splitfile-"):]
+                            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//" + filename for tesselation in range(1,max_rand_tessellations+1)]) + " > " + sysOps.globaldatapath + "nn_indices_" + str(nn_file_index) + ".txt")
+                            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//" + distance_filename for tesselation in range(1,max_rand_tessellations+1)]) + " > " + sysOps.globaldatapath + "nn_distances_" + str(nn_file_index) + ".txt")
+                            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//" + overlap_filename for tesselation in range(1,max_rand_tessellations+1)]) + " > " + sysOps.globaldatapath + "nn_overlap_" + str(nn_file_index) + ".txt")
+                    sysOps.sh("rm " + sysOps.globaldatapath + "tess*/tmp_nn*splitfile*")
+            
+            if not sysOps.check_file_exists("all_landmarks.npy"):
+                # get global landmarks
+                if DEFAULT_TOT_SOURCES*len(tess_range) <= this_GSEobj.Npts:
+                    choice_indices = np.random.choice(this_GSEobj.Npts, size=DEFAULT_TOT_SOURCES*len(tess_range), replace=False)
+                else:
+                    choice_indices = np.concatenate([np.random.choice(this_GSEobj.Npts, size=DEFAULT_TOT_SOURCES, replace=False) for j in range(len(tess_range))]) # if too few points overall, require no-replacement just *within* tessellation sector, not between
+                prev_start = 0
+                for i in range(this_GSEobj.num_workers):
+                    add_landmarks = min(DEFAULT_TOT_SOURCES-prev_start,int(max(1,np.ceil(DEFAULT_TOT_SOURCES/this_GSEobj.num_workers))))
+                    for tesselation,j in zip(tess_range,range(len(tess_range))):
+                        my_landmark_subindices = np.arange(prev_start + j*DEFAULT_TOT_SOURCES, prev_start+add_landmarks + j*DEFAULT_TOT_SOURCES, dtype=np.int32)
+                        np.save(sysOps.globaldatapath + "tess" + str(tesselation) + "//landmarks_" + str(i) + ".npy",choice_indices[my_landmark_subindices]) # leave a copy in each directory
+                        if i == 0: # write once
+                            np.save(sysOps.globaldatapath + "tess" + str(tesselation) + "//landmarks.npy",choice_indices[j*DEFAULT_TOT_SOURCES:((j+1)*DEFAULT_TOT_SOURCES)])
+                    prev_start += add_landmarks
+                np.save(sysOps.globaldatapath + "all_landmarks.npy",choice_indices) # all landmarks
                 
+            for tesselation in tess_range: # for the following steps in GSE, we deal with tesselation's one at a time to avoid lags in re-loading the same data to memory
+                if not sysOps.check_file_exists("tess" + str(tesselation) + "//shortest_paths_dists.npy"):
+                
+                    if max_rand_tessellations > 0 and (not sysOps.check_file_exists("tess" + str(tesselation) + "//nbr_indices_0.txt")):
+                        this_GSEobj.deliver_handshakes('select_nn',np.array([tesselation]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64), merge_prefixes=["nbr_distances_0","nbr_indices_0"],root_delete=False,set_weights=None)
+                    
+                    if not sysOps.check_file_exists("tess" + str(tesselation) + "//nn_mat.npz"):
+                        # re-save nearest neighbors information as csr_matrix
+                        nn_data = np.loadtxt(sysOps.globaldatapath + "tess" + str(tesselation) + "//nbr_distances_0.txt",delimiter=',',dtype=np.float64)
+                        
+                        nn_cols = np.loadtxt(sysOps.globaldatapath + "tess" + str(tesselation) + "//nbr_indices_0.txt",delimiter=',',dtype=np.int32)
+                        nn_rows = np.outer(np.arange(nn_data.shape[0],dtype=np.int32),np.ones(nn_data.shape[1],dtype=np.int32))
+                        nn_mat = csr_matrix((nn_data.reshape(np.prod(nn_data.shape)), (nn_rows.reshape(np.prod(nn_rows.shape)), nn_cols.reshape(np.prod(nn_cols.shape)))), (this_GSEobj.Npts,this_GSEobj.Npts))
+                        nn_mat.sum_duplicates()
+                        nn_mat.eliminate_zeros()
+                        save_npz(sysOps.globaldatapath + "tess" + str(tesselation) + "//nn_mat.npz",nn_mat)
+                        del nn_data, nn_cols, nn_rows, nn_mat
+                                                                    
+                    if not sysOps.check_file_exists("tess" + str(tesselation) + "//shortest_paths_dists.npy"):
+                    
+                    
+                        # run dijkstra
+                        this_GSEobj.deliver_handshakes('shortest_path',np.array([tesselation]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64), merge_prefixes=["shortest_paths_dists"],root_delete=True,set_weights=None)
+                        
+                        # take transpose of shortest_paths_dists so that number of rows = this_GSEobj.Npts
+                        np.save(sysOps.globaldatapath + "tess" + str(tesselation) +  "//shortest_paths_dists.npy", np.loadtxt(sysOps.globaldatapath + "tess" + str(tesselation) +  "//shortest_paths_dists.txt", delimiter=',', dtype=np.float64).T) # transpose
+                    
+                        os.remove(sysOps.globaldatapath + "tess" + str(tesselation) +  "//shortest_paths_dists.txt") # delete original
+                        os.remove(sysOps.globaldatapath + "tess" + str(tesselation) +  "//nn_mat.npz")
+                    
+                    # write landmark_membership.txt
+                    shortest_paths_dists = np.load(sysOps.globaldatapath + "tess" + str(tesselation) +  "//shortest_paths_dists.npy")
+                    shortest_paths_inds = np.load(sysOps.globaldatapath + "tess" + str(tesselation) +  "//landmarks.npy")
+                    #nn_mat = load_npz(sysOps.globaldatapath + "tess" + str(tesselation) + "//nn_mat.npz").tocoo()
+                   
+                    init_shortest_paths_dists = np.array(shortest_paths_dists)
+                    for iter in range(3):
+                        sysOps.throw_status('Performing triangle update ...')
+                        triangle_update(shortest_paths_dists, shortest_paths_inds,this_GSEobj.spat_dims)
+                        if iter < 2:
+                            shortest_paths_dists = 0.5*(shortest_paths_dists+init_shortest_paths_dists)
+                    del init_shortest_paths_dists
+
+                    sysOps.throw_status('Done.')
+                    if np.sum(shortest_paths_dists < 0) > 0:
+                        sysOps.throw_status('ERROR: ' + str(np.sum(shortest_paths_dists < 0)))
+                        sysOps.exitProgram()
+                    np.save(sysOps.globaldatapath + "tess" + str(tesselation) +  "//shortest_paths_dists.npy",shortest_paths_dists)
+                    
+                    if this_GSEobj.shortest_paths_dists is not None and this_GSEobj.shortest_paths_dists[tesselation-1] is not None:
+                        this_GSEobj.shortest_paths_dists[tesselation-1][:,:] = shortest_paths_dists
+                        
+                    this_GSEobj.deliver_handshakes('final_quantile_computation',np.array([tesselation]),np.array([this_GSEobj.Npts]),np.arange(0,this_GSEobj.num_workers,dtype=np.int64), merge_prefixes=["max_nbr_distances","max_nbr_indices","nbr_distances_1","nbr_indices_1"],root_delete=True,set_weights=None)
+                    
+                else:
+                    sysOps.throw_status('Quantiles found pre-calculated in tess' + str(tesselation) + '//')
+                        
+            ######################################################################
+            ##############      GSE processes complete      ###############
+            ######################################################################
+            
+            for tess_index in range(max_rand_tessellations+1):
+                this_GSEobj.unload_shared_data_from_lists(tess_index)
+            
             try:
-                sysOps.sh("rm " + sysOps.globaldatapath + "*mem* " + sysOps.globaldatapath + "div*/*mem*")
+                sysOps.sh("rm " + sysOps.globaldatapath + "*mem* " + sysOps.globaldatapath + "tess*/*mem*")
             except:
                 pass
                                 
@@ -1561,12 +1558,23 @@ def full_gse(output_name, params):
             
             # unlink before replacing
             this_GSEobj.isroot = True
-            for key in  ['seq_evecs','manifold_vecs','manifold_coldims','inv_ellipsoid_mats','seg_assignments','pts_seg_starts','argsort_solns','soln_starts','collated_Xpts','ellipsoid_mats','nn_indices','global_coll_indices','local_coll_indices']:
+            for key in  ['seq_evecs','nn_mat','shortest_paths_dists','seg_assignments','pts_seg_starts','argsort_solns','soln_starts','collated_Xpts','nn_indices','global_coll_indices','local_coll_indices']:
                
                 if key in this_GSEobj.shm_dict:
                     if type(this_GSEobj.shm_dict[key]) == list:
                         for el in this_GSEobj.shm_dict[key]:
-                            if el is not None:
+                            if type(el) == dict:
+                                for dict_el in el:
+                                    if el[dict_el] is not None:
+                                        el[dict_el].close()
+                                        el[dict_el].unlink()
+                                        try:
+                                            sysOps.sh('rm /dev/shm/' + el[dict_el].name) # only valid for linux os
+                                        except:
+                                            pass
+                                        del el[dict_el]
+                                del el
+                            elif el is not None:
                                 el.close()
                                 el.unlink()
                                 try:
@@ -1582,56 +1590,100 @@ def full_gse(output_name, params):
                         except:
                             pass
                         del this_GSEobj.shm_dict[key]
-                        
+            
+            # currently stored eigenvectors will not be re-used, clear up memory
+            del this_GSEobj.seq_evecs
+            this_GSEobj.seq_evecs = None
+
+            for q in range(num_quantiles):
+                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//nbr_distances_" + str(q) + ".txt" for tesselation in tess_range])
+                          + " > " + sysOps.globaldatapath + "nbr_distances_" + str(q) + ".txt")
+                sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//nbr_indices_" + str(q) + ".txt" for tesselation in tess_range])
+                          + " > " + sysOps.globaldatapath + "nbr_indices_" + str(q) + ".txt")
+                          
         
-            if GSE_iteration == GSE_iterations-1:
-                if GSE_final_eigenbasis_size is None:
-                    this_GSEobj.inference_eignum = int(inference_eignum)
-                else:
-                    this_GSEobj.inference_eignum = int(GSE_final_eigenbasis_size)
-            else:
-                this_GSEobj.inference_eignum = int(inference_eignum)
-                
-            n_evecs_per_q = this_GSEobj.inference_eignum
-                
-            if not sysOps.check_file_exists('evecs.npy'):
-                sysOps.throw_status("Generating final eigenbasis ...")
-                for q in range(num_quantiles):
-                    this_GSEobj.generate_final_eigenbasis(q)
-                this_GSEobj.eigen_decomp(orth=True,projmatfile_indices=[0,1],apply_dot2=True)
-                
-            else:
-                sysOps.throw_status('Loading eigenvectors ...')
-                this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "evecs.npy").T
+            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//max_nbr_distances.txt" for tesselation in tess_range])
+                      + " > " + sysOps.globaldatapath + "max_nbr_distances.txt")
+            sysOps.sh("paste -d, " + " ".join([sysOps.globaldatapath + "tess" + str(tesselation) + "//max_nbr_indices.txt" for tesselation in tess_range])
+                      + " > " + sysOps.globaldatapath + "max_nbr_indices.txt")
+                                    
+            try:
+                sysOps.sh("rm -r " + sysOps.globaldatapath + "tess* ")
+                sysOps.sh("rm -r " + sysOps.globaldatapath + "nn*txt")
+            except:
+                pass
+                                      
+            merged_index_file = np.zeros([this_GSEobj.Npts,2*this_GSEobj.inference_eignum*(max(1,max_rand_tessellations)),3],dtype=np.int32)
+            merged_index_file[:,:,2] = np.loadtxt(sysOps.globaldatapath + "max_nbr_indices.txt",dtype=np.int32,delimiter=',')
+            merged_index_file[:,:,1] = np.loadtxt(sysOps.globaldatapath + "nbr_indices_1.txt",dtype=np.int32,delimiter=',')
+            merged_index_file[:,:,0] = np.loadtxt(sysOps.globaldatapath + "nbr_indices_0.txt",dtype=np.int32,delimiter=',')
+            np.save(sysOps.globaldatapath + "nbr_indices.npy",merged_index_file)
+            del merged_index_file
+            
+            merged_dist_file = np.zeros([this_GSEobj.Npts,2*this_GSEobj.inference_eignum*(max(1,max_rand_tessellations)),2],dtype=np.float64)
+            merged_dist_file[:,:,1] = np.loadtxt(sysOps.globaldatapath + "nbr_distances_1.txt",dtype=np.float64,delimiter=',')
+            merged_dist_file[:,:,0] = np.loadtxt(sysOps.globaldatapath + "nbr_distances_0.txt",dtype=np.float64,delimiter=',')
+            np.save(sysOps.globaldatapath + "nbr_distances.npy",merged_dist_file)
+            del merged_dist_file
+            
+            os.remove(sysOps.globaldatapath + "nbr_indices_0.txt")
+            os.remove(sysOps.globaldatapath + "nbr_indices_1.txt")
+            os.remove(sysOps.globaldatapath + "max_nbr_indices.txt")
+            os.remove(sysOps.globaldatapath + "nbr_distances_0.txt")
+            os.remove(sysOps.globaldatapath + "nbr_distances_1.txt")
+            os.remove(sysOps.globaldatapath + "max_nbr_distances.txt")
+            sysOps.throw_status('Done.')
         
-            if GSE_iteration != GSE_iterations-1:
-                for rm_str in ['*nbr*','length*','nn*','man*','*ellips*','*coll*']:
-                    try:
-                        sysOps.sh("rm " + sysOps.globaldatapath + rm_str + " " + sysOps.globaldatapath + "div*//" + rm_str)
-                    except:
-                        pass
-                    
-                os.remove(sysOps.globaldatapath + "orig_evecs_gapnorm.npy")
+        if not sysOps.check_file_exists('subsample_pairings_0.npz'):
+            if this_GSEobj.seq_evecs is not None:
+                sysOps.throw_status("Clearing memory...")
                 del this_GSEobj.seq_evecs
+                this_GSEobj.seq_evecs = None
+            print_subsample_pts(this_GSEobj,"nbr_indices.npy","nbr_distances.npy",print_bipartite = False)
+    
+        if GSE_final_eigenbasis_size is None:
+            this_GSEobj.inference_eignum = int(inference_eignum)
+        else:
+            this_GSEobj.inference_eignum = int(GSE_final_eigenbasis_size)
+        
+        if not sysOps.check_file_exists('evecs.npy'):
+            sysOps.throw_status("Generating final eigenbasis ...")
+            for q in range(1):
+                sysOps.throw_status("q = " + str(q))
+                this_GSEobj.generate_final_eigenbasis(q)
+            if sysOps.check_file_exists("preorthbasis.npy"):
+                this_GSEobj.eigen_decomp(orth=True,projmatfile_indices=[0],apply_dot2=True,krylov_approx="preorthbasis.npy")
+            else:
+                this_GSEobj.eigen_decomp(orth=True,projmatfile_indices=[0],apply_dot2=True)
+            
+        else:
+            sysOps.throw_status('Loading eigenvectors ...')
+            this_GSEobj.seq_evecs = np.load(sysOps.globaldatapath + "evecs.npy").T
+    
     else: # analyze merged data sets
         if this_GSEobj is None:
-            this_GSEobj = GSEobj(inference_dim,GSE_final_eigenbasis_size,gamma=gamma)
+            this_GSEobj = GSEobj(inference_dim,GSE_final_eigenbasis_size)
         
-    if (output_name is None or not sysOps.check_file_exists(output_name)):
+    if (output_name is None or not (sysOps.check_file_exists('iter' + str(this_GSEobj.inference_eignum) + '_' + output_name) or sysOps.check_file_exists(output_name))):
         if this_GSEobj is None:
-            this_GSEobj = GSEobj(inference_dim,GSE_final_eigenbasis_size,gamma=gamma)
-        if ('-is_subset' not in params) or (not params['-is_subset']):
-            this_GSEobj.eigen_decomp(orth=True,projmatfile_indices=[0,1],apply_dot2=True)
+            this_GSEobj = GSEobj(inference_dim,GSE_final_eigenbasis_size)
+        if this_GSEobj.seq_evecs is None or ('-is_subset' not in params) or (not params['-is_subset']):
+            this_GSEobj.eigen_decomp(orth=True,projmatfile_indices=[0],apply_dot2=True)
         eig_ordering = list()
-        scale_boundaries = list([this_GSEobj.spat_dims,this_GSEobj.inference_eignum])
-        this_GSEobj.scale_boundaries = np.array(scale_boundaries)
         this_GSEobj.inference_eignum = this_GSEobj.seq_evecs.shape[0]
         
         sysOps.throw_status('Running spec_GSEobj ...')
         if not sysOps.check_file_exists('iter' + str(this_GSEobj.inference_eignum) + '_' + output_name):
             spec_GSEobj(this_GSEobj, output_name)
         del this_GSEobj.seq_evecs
+        this_GSEobj.seq_evecs = None
             
+    if (sysOps.check_file_exists('iter' + str(this_GSEobj.inference_eignum) + '_' + output_name) or sysOps.check_file_exists(output_name)) and (params['-calc_final'] is not None):
+        if sysOps.check_file_exists('iter' + str(this_GSEobj.inference_eignum) + '_' + output_name):
+            sysOps.sh('cp -p ' + sysOps.globaldatapath +  'iter' + str(this_GSEobj.inference_eignum) + '_' + output_name + " " + sysOps.globaldatapath + output_name)
+            get_clusters(this_GSEobj, output_name)
+        print_final_results(output_name,inference_dim,label_dir=params['-calc_final'],intermed_indexing_directory=params['-intermed_indexing_directory'])
+        
     del this_GSEobj
 
 @jit("void(float64[:,:],int64[:,:],int64[:,:], float64[:,:],float64[:,:],float64[:],float64[:],int64[:],int64[:],int64,int64,int64,int64)",nopython=True)
@@ -1649,574 +1701,79 @@ def get_embedded_pseudolinks(pseudolinks, pseudolink_indices, embed_nn_indices, 
     
     return
 
-def get_clusters(new_GSEobj, output_name, stopping_conductances = [0.01,0.05,0.2]):
-    sysOps.throw_status('Assigning clusters with fine-scale stopping_conductances = ' + str(stopping_conductances))
-    
-    if sysOps.check_file_exists(output_name) and not sysOps.check_file_exists('clust_assignments.txt'):
-        new_GSEobj.Xpts = np.loadtxt(sysOps.globaldatapath + output_name,delimiter=',',dtype=np.float64)[:,1:]
-        pseudo_link_data = np.concatenate([new_GSEobj.link_data,new_GSEobj.link_data[:,np.array([1,0,2])]],axis=0)
-        pseudo_link_data[:,2] = 0
-        nbrs = NearestNeighbors(n_neighbors=int(pseudo_link_data.shape[0]/new_GSEobj.Npts)+1).fit(new_GSEobj.Xpts)
-        nn_distances, nn_indices = nbrs.kneighbors(new_GSEobj.Xpts)
-        nn_distances = nn_distances[:,1:] # exclude self-self association
-        nn_indices = nn_indices[:,1:]
-        self_indices = np.outer(np.arange(new_GSEobj.Npts,dtype=np.int64),np.ones(nn_indices.shape[1],dtype=np.int64))
-        added_pseudo_link_data = np.zeros([np.prod(self_indices.shape),3],dtype=np.float64)
-        added_pseudo_link_data[:,0] = self_indices.reshape(added_pseudo_link_data.shape[0])
-        added_pseudo_link_data[:,1] = nn_indices.reshape(added_pseudo_link_data.shape[0])
-        added_pseudo_link_data = added_pseudo_link_data[added_pseudo_link_data[:,1]>=0,:]
-        pseudo_link_data = np.concatenate([pseudo_link_data,added_pseudo_link_data],axis=0)
-        
-        for i in range(pseudo_link_data.shape[0]):
-            pt_tp1 = int(pseudo_link_data[i,0])
-            pt_tp2 = int(pseudo_link_data[i,1])
-            sqdist = LA.norm(np.subtract(new_GSEobj.Xpts[pt_tp1,:],new_GSEobj.Xpts[pt_tp2,:]))**2
-            pseudo_link_data[i,2] = 0
-            
-            sum1 = new_GSEobj.sum_pt_tp1_link[pt_tp1]+new_GSEobj.sum_pt_tp2_link[pt_tp1]
-            sum2 = new_GSEobj.sum_pt_tp1_link[pt_tp2]+new_GSEobj.sum_pt_tp2_link[pt_tp2]
-            if sum1 > 0 and sum2 > 0:
-                factor = 2*((1.0/sum1)+(1.0/sum2))
-                if factor > 0:
-                    pseudo_link_data[i,2] += np.exp(-(sqdist/factor)-(new_GSEobj.spat_dims/2.0)*np.log(factor))
-            else:
-                pseudo_link_data[i,2] = 0
 
-        pseudo_link_data = pseudo_link_data[pseudo_link_data[:,2]>0,:] # eliminate zeros
-        # eliminate redundant pairings
-        pseudo_link_data = np.array(sorted(pseudo_link_data.tolist(), key = lambda x: (x[0], x[1])))
-        unique_el = np.append(0,np.where(np.sum(np.abs(np.diff(pseudo_link_data[:,:2],axis=0)),axis=1)>0)[0])
-        pseudo_link_data  = pseudo_link_data[unique_el,:]
-        pseudo_link_data[:,2] *= 1E10
-        pseudo_link_data[pseudo_link_data[:,2]<1,2] = 1
-        
-        new_GSEobj.link_data = pseudo_link_data
-        final_memberships = list()
-        
-        for stopping_conductance in stopping_conductances:
-            sysOps.throw_status('Performing cluster analysis with stopping_conductance = ' + str(stopping_conductance))
-            segmentation_analysis(new_GSEobj, stopping_conductance = stopping_conductance,
-                                  min_conductance_assoc = None, inp_eig_cut = 0, maxpts = 100000,
-                                  minpts = 50, minlink = 1)
-           
-            final_memberships.append(np.loadtxt(sysOps.globaldatapath + "Xpts_segment_" + str(stopping_conductance) + ".txt",delimiter=',',dtype=np.int64)[:,1].reshape([new_GSEobj.Npts,1]))
-        np.savetxt(sysOps.globaldatapath + 'clust_assignments.txt',np.concatenate(final_memberships,axis=1),delimiter=',',fmt='%i')
-        try:
-            sysOps.sh("rm " + sysOps.globaldatapath + "Xpts_segment_*")
-        except:
-            pass
-    del new_GSEobj.Xpts, new_GSEobj.subsample_pairings
+def get_clusters(new_GSEobj, output_name, leiden_res_list = [1,10,20]):
+    sysOps.throw_status('Assigning clusters with leiden resolutions ' + str(leiden_res_list))
+    del new_GSEobj.subsample_pairings
+    if sysOps.check_file_exists(output_name) and not sysOps.check_file_exists('clust_assignments.npy'):
+        # generate weighted csr_matrix
+        # set weights: n_{ij} e^{-x_{ij}^2}
     
+        Xpts = np.loadtxt(sysOps.globaldatapath + output_name,delimiter=',',dtype=np.float64)[:,1:(new_GSEobj.spat_dims+1)]
+        nbrs = NearestNeighbors(n_neighbors=new_GSEobj.spat_dims+2).fit(Xpts)
+        nn_distances, nn_indices = nbrs.kneighbors(Xpts)
+        nn_distances = nn_distances[:,1:]
+        nn_indices = nn_indices[:,1:]
+        pseudo_links = np.concatenate([np.outer(np.arange(new_GSEobj.Npts),np.ones(new_GSEobj.spat_dims+1)).reshape([new_GSEobj.Npts*(new_GSEobj.spat_dims+1),1]),nn_indices.reshape([new_GSEobj.Npts*(new_GSEobj.spat_dims+1),1])],axis=1)
+        pseudo_links = np.int32(np.concatenate([pseudo_links,new_GSEobj.link_data[:,:2]],axis=0))
+        
+        pseudo_link_data = np.zeros(pseudo_links.shape[0],dtype=np.float64) # initialize as log
+        for i in range(pseudo_link_data.shape[0]):
+            umi1 = int(pseudo_links[i,0])
+            umi2 = int(pseudo_links[i,1])
+            pseudo_link_data[i] = -LA.norm(Xpts[umi1,:]-Xpts[umi2,:])**2
+        del Xpts
+        adj_data = csr_matrix((np.exp(pseudo_link_data), (pseudo_links[:,0], pseudo_links[:,1])), (new_GSEobj.Npts, new_GSEobj.Npts))
+        adj_data += adj_data.T
+                                    
+        diag_mat = csc_matrix((np.power(adj_data.dot(np.ones(new_GSEobj.Npts,dtype=np.float64)),-0.5), (np.arange(new_GSEobj.Npts,dtype=np.int32), np.arange(new_GSEobj.Npts,dtype=np.int32))), (new_GSEobj.Npts, new_GSEobj.Npts))
+        adj_data = diag_mat.dot(adj_data).dot(diag_mat)
+        
+        del diag_mat,pseudo_link_data,nn_distances, nn_indices, nbrs
+        
+        final_memberships = list()
+        for leiden_res in leiden_res_list:
+            sysOps.throw_status('Performing leiden clustering using resolution = ' + str(leiden_res))
+            sources, targets = adj_data.nonzero()
+            edges = list(zip(sources, targets))
+            mygraph = igraph.Graph(edges=edges)
+            mygraph.es['weight'] = adj_data.data
+            partition_type = leidenalg.RBConfigurationVertexPartition
+            partition = leidenalg.find_partition(mygraph, partition_type, weights=mygraph.es['weight'], resolution_parameter=leiden_res)
+            sysOps.throw_status('Done.')
+            final_memberships.append(np.array(partition.membership).reshape([new_GSEobj.Npts,1]))
+        
+        np.save(sysOps.globaldatapath + 'clust_assignments.npy',np.concatenate(final_memberships,axis=1))
+       
     # construct UEI matrix of clusters
-    clust_assignments = np.loadtxt(sysOps.globaldatapath + 'clust_assignments.txt',delimiter=',',dtype=np.int64)
+    clust_assignments = np.load(sysOps.globaldatapath + 'clust_assignments.npy')
     sysOps.throw_status('Loaded clust_assignments.txt. Printing segment-UEI matrices')
-    for stopping_conductance, i in zip(stopping_conductances,range(clust_assignments.shape[1])):
+            
+    for leiden_res, i in zip(leiden_res_list,range(clust_assignments.shape[1])):
         # indices in clust_assignments are assumed derived from call to generate_complete_indexed_arr(), meaning that all indices corresponding to non-clusters (size 1) are numerically larger than those that are clusters
         clust_frequencies = np.histogram(clust_assignments[:,i],bins=np.arange(np.max(clust_assignments[:,i])+2))[0]
         max_non_singleton = np.max(np.where(clust_frequencies > 1)[0])
         if max_non_singleton >= 3: # otherwise uninteresting
             clust_ueis = np.array(new_GSEobj.link_data)
-            clust_ueis[:,:2] = clust_assignments[np.int64(clust_ueis[:,:2]),i]
-            clust_ueis = clust_ueis[np.multiply(clust_ueis[:,0]<=max_non_singleton,clust_ueis[:,1]<=max_non_singleton),:]
-            clust_uei_matrix = csc_matrix((clust_ueis[:,2], (np.int64(clust_ueis[:,0]), np.int64(clust_ueis[:,1]))), (max_non_singleton+1, max_non_singleton+1))
+            clust_ueis[:,:2] = clust_assignments[np.int32(clust_ueis[:,:2]),i]
+            max_clust_index = int(np.max(clust_ueis[:,:2]))
+            clust_uei_matrix = csc_matrix((clust_ueis[:,2], (np.int64(clust_ueis[:,0]), np.int64(clust_ueis[:,1]))), (max_clust_index+1, max_clust_index+1))
+            sysOps.throw_status('Non-trivial clusters: ' + str(max_non_singleton+1))
             clust_uei_matrix.sum_duplicates()
             clust_uei_matrix += clust_uei_matrix.T # symmetrize
-            save_npz(sysOps.globaldatapath + 'clust_uei_' + str(stopping_conductance) + '.npz',clust_uei_matrix)
-            diag_mat = csc_matrix((np.power(clust_uei_matrix.dot(np.ones(max_non_singleton+1)),-1.0), (np.arange(max_non_singleton+1,dtype=np.int64), np.arange(max_non_singleton+1,dtype=np.int64))), (max_non_singleton+1, max_non_singleton+1))
+            
+            sumrows = clust_uei_matrix.dot(np.ones(max_clust_index+1))
+            sumrows[sumrows == 0] = 1.0
             # row-normalize
-            clust_uei_matrix = diag_mat.dot(clust_uei_matrix)
-            evals, evecs = gl_eig_decomp(None,None,None, min(10,int(max_non_singleton/2)), max_non_singleton+1, new_GSEobj.spat_dims, False,linop=clust_uei_matrix)
-            np.savetxt(sysOps.globaldatapath + 'clust_evecs_'  + str(stopping_conductance) + '.txt',evecs,delimiter=',',fmt='%.10e')
+            clust_uei_matrix = scipy.sparse.diags(np.power(sumrows,-1.0)).dot(clust_uei_matrix)
+            clust_uei_matrix = clust_uei_matrix - scipy.sparse.diags(np.ones(max_clust_index+1,dtype=np.float64))
+            
+            evals, evecs = gl_eig_decomp(None,None,None, min(10,int(max_clust_index/2)), max_clust_index+1, new_GSEobj.spat_dims, False,linop=clust_uei_matrix)
+            np.savetxt(sysOps.globaldatapath + 'clust_evecs_'  + str(leiden_res) + '.txt',evecs,delimiter=',',fmt='%.10e')
             del clust_uei_matrix
                     
-@jit("void(float64[:,:,:],int64[:,:],int64[:],float64[:,:,:],int64[:],  int64[:], float64[:,:], int64[:],int64[:], float64[:,:], int64[:], int64[:],float64[:], float64[:], float64[:],float64[:],int64,int64,int64,int64,int64,int64)",nopython=True)
-def get_local_ellipsoids(manifold_vecs,manifold_coldims,tmp_coldim_lookup,ellipsoid_mats,
-                         seg_assignments,  pts_seg_starts, collated_Xpts,
-                         global_coll_indices,local_coll_indices,
-                         link_data,sorted_link_data_inds,sorted_link_data_ind_starts,sum_pt_tp1_link,sum_pt_tp2_link,diff_buff,
-                         dotprod_buff,dims,max_segment_index,collated_dim,Nassoc,start_ind,end_ind):
-                                
-    # GSEobj.sorted_link_data_inds will consist of indices that order the non-stored vector np.concatenate([link_data[:,0], link_data[:,1]]) for the first
-    # link_data.shape[0] rows by the first column and the second link_data.shape[0] rows by the second column; GSEobj.sorted_link_data_ind_starts will provide locations of where new indices start in this ordering
-    for n in range(start_ind,end_ind):
-        my_link = 0.0
-        ellipsoid_mats[n-start_ind,:,:] = 0.0
-        for i in range(sorted_link_data_ind_starts[n],sorted_link_data_ind_starts[n+1]):
-            # perform dot-product, given that dimensions are ordered numerically
-            # first go through the lower-indexed segment
-            other_pts = int(link_data[sorted_link_data_inds[i]%Nassoc,int(sorted_link_data_inds[i] < Nassoc)])
-            use_dim_index = 0
-            n_seg_ind = pts_seg_starts[seg_assignments[n]] + seg_assignments[other_pts] - int(seg_assignments[n]<seg_assignments[other_pts])
-            other_pts_seg_ind =  pts_seg_starts[seg_assignments[other_pts]] + seg_assignments[n] - int(seg_assignments[other_pts]<seg_assignments[n])
-            
-            if seg_assignments[other_pts] < seg_assignments[n]:
-                diff_buff[:collated_dim] = np.subtract(collated_Xpts[n_seg_ind,2:],collated_Xpts[local_coll_indices[other_pts],2:])
-                diff_buff[collated_dim:(2*collated_dim)] = np.subtract(collated_Xpts[local_coll_indices[n],2:],collated_Xpts[other_pts_seg_ind,2:])
-                tmp_coldim_lookup[:collated_dim] = np.add(collated_dim*seg_assignments[other_pts],np.arange(collated_dim))
-                tmp_coldim_lookup[collated_dim:(2*collated_dim)] = np.add(collated_dim*seg_assignments[n],np.arange(collated_dim))
-                use_dim_index = 2*collated_dim
-            elif seg_assignments[other_pts] > seg_assignments[n]:
-                diff_buff[:collated_dim] = np.subtract(collated_Xpts[local_coll_indices[n],2:],collated_Xpts[other_pts_seg_ind,2:])
-                diff_buff[collated_dim:(2*collated_dim)] = np.subtract(collated_Xpts[n_seg_ind,2:],collated_Xpts[local_coll_indices[other_pts],2:])
-                tmp_coldim_lookup[:collated_dim] = np.add(collated_dim*seg_assignments[n],np.arange(collated_dim))
-                tmp_coldim_lookup[collated_dim:(2*collated_dim)] = np.add(collated_dim*seg_assignments[other_pts],np.arange(collated_dim))
-                use_dim_index = 2*collated_dim
-            else:
-                diff_buff[:collated_dim] = np.subtract(collated_Xpts[local_coll_indices[n],2:],collated_Xpts[local_coll_indices[other_pts],2:])
-                tmp_coldim_lookup[:collated_dim] = np.add(collated_dim*seg_assignments[n],np.arange(collated_dim))
-                use_dim_index = collated_dim
-            
-            diff_buff[use_dim_index:(use_dim_index+collated_dim)] = np.subtract(collated_Xpts[global_coll_indices[n],2:],collated_Xpts[global_coll_indices[other_pts],2:])
-            tmp_coldim_lookup[use_dim_index:(use_dim_index+collated_dim)] = np.add((max_segment_index+1)*collated_dim,np.arange(collated_dim))
-            use_dim_index += collated_dim
-
-            dotprod_buff[:dims] = 0.0
-            d_eig = 0
-            buff_d = 0
-            while (d_eig < collated_dim) and (buff_d < use_dim_index):
-                if tmp_coldim_lookup[buff_d] == manifold_coldims[n,d_eig]:
-                    dotprod_buff[:dims] += manifold_vecs[n,:dims,d_eig]*diff_buff[buff_d]
-                    buff_d += 1
-                    d_eig += 1
-                elif tmp_coldim_lookup[buff_d] < manifold_coldims[n,d_eig]:
-                    buff_d += 1
-                else:
-                    d_eig += 1
-                    
-            for d1 in range(dims):
-                for d2 in range(dims):
-                    ellipsoid_mats[n-start_ind,d1,d2] += dotprod_buff[d1]*dotprod_buff[d2]*link_data[sorted_link_data_inds[i]%Nassoc,2]/(sum_pt_tp1_link[other_pts] + sum_pt_tp2_link[other_pts])
-            
-            my_link += link_data[sorted_link_data_inds[i]%Nassoc,2]/(sum_pt_tp1_link[other_pts] + sum_pt_tp2_link[other_pts])
-        
-        ellipsoid_mats[n-start_ind,:,:] /= my_link
-    return
     
-@jit("void(float64[:,:,:],int64[:,:],float64[:,:,:],float64[:,:,:],int64[:,:],float64[:,:],int64,int64,int64,int64,int64)",nopython=True)
-def smooth_ellipsoids(manifold_vecs,manifold_coldims,ellipsoid_mats,newellipsoid_mats,nn_indices,dotprod_buff,collated_dim,dims,k_neighbors,start_ind,end_ind):
-    for n in range(start_ind,end_ind):
-        myweight = 0.0
-        for i in range(k_neighbors+1):
-            other_pts = nn_indices[n,i]
-            for d1 in range(dims):
-                for d2 in range(dims):
-                    dotprod = 0.0
-                    n_d_eig = 0
-                    other_d_eig = 0
-                    while n_d_eig < collated_dim and other_d_eig < collated_dim:
-                        if manifold_coldims[n,n_d_eig] == manifold_coldims[other_pts,other_d_eig]:
-                            dotprod += manifold_vecs[n,d1,n_d_eig]*manifold_vecs[other_pts,d2,other_d_eig]
-                            n_d_eig += 1
-                            other_d_eig += 1
-                        elif manifold_coldims[n,n_d_eig] < manifold_coldims[other_pts,other_d_eig]:
-                            n_d_eig += 1
-                        else:
-                            other_d_eig += 1
-                    dotprod_buff[d1,d2] = dotprod
-            
-            newellipsoid_mats[n-start_ind,:,:] += dotprod_buff.dot(ellipsoid_mats[other_pts,:,:].dot(dotprod_buff.T))
-            abs_det = np.power(np.abs(LA.det(dotprod_buff.dot(dotprod_buff.T))),1.0/dims)
-            myweight += abs_det
-        
-        if myweight > 0.0: # if not, edge case
-            newellipsoid_mats[n-start_ind,:,:] /= myweight
-    return
-    
-    
-@jit("void(float64[:,:,:],int64[:,:],float64[:],int64[:],int64[:],int64[:],bool_[:],float64[:,:],int64[:,:],int64[:],int64[:], float64[:,:],int64[:],int64[:],float64[:],float64[:,:],float64[:],int64,int64,int64,int64,int64,int64,int64)",nopython=True)
-def get_local_manifold(manifold_vecs,manifold_coldims,
-                       tmp_sumsq,tmp_coldim_lookup,tmp_seg_lookup,dim_buff,use_dims,
-                       outerprodbuff, nn_indices,
-                       seg_assignments, pts_seg_starts, collated_Xpts,
-                       global_coll_indices,local_coll_indices,
-                       Sbuff,Vhbuff,diffbuff,dims,k_neighbors,max_segment_index,collated_dim,sparsity,start_ind,end_ind):
-    # manifold_vecs is N (Npt_tp1 or Npt_tp2) x dims x eignum
-    # outerprodbuff is eignum x eignum
-    # sorted_link_data is Nassoc (not passed) x 3, containing sorted index in 1st column
-    # sorted_link_data_starts contains indices where 1st column of sorted_link_data changes value (of size N+1)
-    # nd_coords is embedded coordinates
-    # Sbuff has size eignum x 1
-    # Vhbuff has size eignum x eignum
-    # diffbuff has size eignum x 1
-    
-    #global_coll_indices[:] = -1
-    #local_coll_indices[:] = -1
-    #for n in range(Npts):
-    #    for i in range(pts_seg_starts[n+max_segment_index+1],pts_seg_starts[n+max_segment_index+2]):
-    #        if collated_Xpts[i,0] == max_segment_index+1:
-    #            global_coll_indices[n] = i
-    #        else:
-    #            local_coll_indices[n] = i
-    tmp_coldim_lookup[:collated_dim] = np.add(collated_dim*(max_segment_index+1),np.arange(collated_dim)) # global dimensions
-    tmp_seg_lookup[0] = max_segment_index+1
-    
-    for n in range(start_ind,end_ind):
-
-        outerprodbuff[:] = 0.0
-        tmp_sumsq[:] = 0.0
-        tot_segs_assoc = 1 # include global dimensions assigned above
-        tmp_coldim_lookup[tot_segs_assoc*collated_dim:
-                          ((tot_segs_assoc+1)*collated_dim)] = np.add(collated_dim*seg_assignments[n],
-                                                                      np.arange(collated_dim))
-        tmp_seg_lookup[1] = seg_assignments[n]
-        tot_segs_assoc += 1
-        use_dims[:] = False
-        
-        for tasknum in range(2):
-            my_assoc = 0
-            for i in range(k_neighbors+1):
-                
-                other_pts = nn_indices[n-start_ind,i]
-                
-                if other_pts != n:
-                    on_seg_assoc = 1
-                    if seg_assignments[other_pts] != seg_assignments[n]:
-                        on_seg_assoc = -1
-                        for j in range(2,tot_segs_assoc):
-                            if tmp_seg_lookup[j] == seg_assignments[other_pts]:
-                                on_seg_assoc = int(j)
-                                break
-                        if on_seg_assoc < 0:
-                            if tasknum != 0:
-                                print(-3) # shouldn't be possible
-                            on_seg_assoc = int(tot_segs_assoc)
-                            tmp_seg_lookup[on_seg_assoc] = seg_assignments[other_pts]
-                            tmp_coldim_lookup[tot_segs_assoc*collated_dim:
-                                              ((tot_segs_assoc+1)*collated_dim)] = np.add(collated_dim*seg_assignments[other_pts],np.arange(collated_dim))
-                            tot_segs_assoc += 1
-                            
-                    use_dim_index = 0 # will be used to keep track of dimensions used specifically, and only when tasknum == 1
-                    
-                    for d in range(collated_dim):
-                        mydiff = collated_Xpts[global_coll_indices[n],2+d]-collated_Xpts[global_coll_indices[other_pts],2+d]
-                        if tasknum == 0:
-                            diffbuff[d] = mydiff*mydiff # tabulate all global dimensions first
-                        elif use_dims[d]:
-                            diffbuff[use_dim_index] = mydiff
-                            use_dim_index += 1
-                        
-                    if seg_assignments[other_pts] == seg_assignments[n]: # tabulate all dimensions from the same segment
-                        for d in range(collated_dim):
-                            mydiff = collated_Xpts[local_coll_indices[n],2+d]-collated_Xpts[local_coll_indices[other_pts],2+d]
-                            if tasknum == 0:
-                                diffbuff[collated_dim + d] = mydiff*mydiff
-                            elif use_dims[collated_dim + d]:
-                                diffbuff[use_dim_index] = mydiff
-                                use_dim_index += 1
-                        
-                        if tasknum != 0:
-                            use_dim_index += np.sum(use_dims[(2*collated_dim):((tot_segs_assoc)*collated_dim)])
-                        
-                    else:
-                        for d in range(collated_dim):
-                            other_pts_seg_ind =  pts_seg_starts[seg_assignments[other_pts]] + seg_assignments[n] - int(seg_assignments[other_pts]<seg_assignments[n])
-            
-                            mydiff = collated_Xpts[local_coll_indices[n],2+d]-collated_Xpts[other_pts_seg_ind,2+d]
-                            if tasknum == 0:
-                                diffbuff[collated_dim + d] = mydiff*mydiff
-                            elif use_dims[collated_dim + d]:
-                                diffbuff[use_dim_index] = mydiff
-                                use_dim_index += 1
-                                
-                        if tasknum != 0:
-                            # skipped over other segment dimensions
-                            use_dim_index += np.sum(use_dims[(2*collated_dim):((on_seg_assoc)*collated_dim)])
-                        
-                        for d in range(collated_dim):
-                            n_seg_ind = pts_seg_starts[seg_assignments[n]] + seg_assignments[other_pts] - int(seg_assignments[n]<seg_assignments[other_pts])
-                            mydiff = collated_Xpts[n_seg_ind,2+d]-collated_Xpts[local_coll_indices[other_pts],2+d]
-                            if tasknum == 0:
-                                diffbuff[(on_seg_assoc*collated_dim) + d] = mydiff*mydiff
-                            elif use_dims[(on_seg_assoc*collated_dim) + d]:
-                                diffbuff[use_dim_index] = mydiff
-                                use_dim_index += 1
-                        
-                        if tasknum != 0:
-                            use_dim_index += np.sum(use_dims[((on_seg_assoc+1)*collated_dim):((tot_segs_assoc)*collated_dim)])
-                            
-                    compared_dims = tot_segs_assoc*collated_dim
-                    if tasknum == 0:
-                        tmp_sumsq[:compared_dims] += diffbuff[:compared_dims]/np.sum(diffbuff[:compared_dims])
-                        diffbuff[:compared_dims] = 0.0
-                    else:
-                        if use_dim_index != sparsity:
-                            print(-n)
-                        outerprodbuff[my_assoc,:] = diffbuff[:use_dim_index]
-                        diffbuff[:use_dim_index] = 0.0
-                        mynorm = LA.norm(outerprodbuff[my_assoc,:])
-                        if mynorm > 0:
-                            outerprodbuff[my_assoc,:] /= mynorm
-                            my_assoc += 1
-            
-            if tasknum == 0:
-                if compared_dims > sparsity:
-                    dim_buff[:compared_dims] = np.argsort(-tmp_sumsq[:compared_dims]) # sort highest to lowest
-                    use_dims[:compared_dims] = False
-                    use_dims[:compared_dims][dim_buff[:sparsity]] = True
-                else:
-                    use_dims[:compared_dims] = True
-                manifold_coldims[n-start_ind,:] = tmp_coldim_lookup[:compared_dims][use_dims[:compared_dims]]
-        size_svd = min(my_assoc,sparsity)
-        
-        for d1 in range(sparsity):
-            for d2 in range(d1+1):
-                dotprod = 0.0
-                for d3 in range(my_assoc):
-                    dotprod += outerprodbuff[d3,d1]*outerprodbuff[d3,d2]
-                Vhbuff[d1,d2] = dotprod
-                Vhbuff[d2,d1] = dotprod
-                
-        # sum differences between rows
-        
-        if size_svd >= dims:
-            try:
-                Sbuff[:sparsity],Vhbuff[:sparsity,:sparsity] = LA.eigh(Vhbuff[:sparsity,:sparsity])
-                #outerprodbuff[:my_assoc,:size_svd],Sbuff[:size_svd],Vhbuff[:size_svd,:sparsity] = LA.svd(outerprodbuff[:my_assoc,:],full_matrices=False)
-                # re-set to zero
-            
-                if k_neighbors >= dims:
-                    manifold_vecs[n-start_ind,:,:] = Vhbuff[:sparsity,np.argsort(-np.abs(Sbuff[:sparsity]))[:dims]].T
-                else:
-                    manifold_vecs[n-start_ind,:k_neighbors,:] = Vhbuff[:sparsity,np.argsort(-np.abs(Sbuff[:sparsity]))[:k_neighbors]].T
-                    manifold_vecs[n-start_ind,k_neighbors:,:] = 0.0
-            except:
-                pass
-       
-    return
-        
-@njit("void(float64[:,:,:],float64[:,:,:],int64[:,:,:], int64[:],int64[:],float64[:,:],int64[:],int64[:],int64[:],int64[:],float64[:],int64[:],int64[:],int64[:],float64[:],float64[:],float64[:],float64[:,:,:],int64[:,:],float64[:,:,:],float64[:,:],int64[:,:],float64[:,:],float64[:,:],int64[:],int64[:],float64[:,:],float64[:,:],int64,int64,int64,int64,int64,int64,int64,int64,int64,int64,int64,int64)",fastmath=True)
-def get_rand_neighbors(distances,err_distances,indices,
-                       seg_assignments, pts_seg_starts, collated_Xpts,
-                       global_coll_indices, local_coll_indices,
-                       tmp_coldim_lookup,
-                       indices_buff,dist_buff,
-                       ref_pts_buff,reduced_sampling_buff,sampling_buff,
-                       diff_buff,Mi_xvec,Mj_xvec,
-                       manifold_vecs,manifold_coldims,inv_ellipsoid_mats,
-                       nn_dists,nn_indices,manifold_vecs_buff1,manifold_vecs_buff2,manifold_coldims_buff1,manifold_coldims_buff2,inv_ellipsoid_mats_buff1,inv_ellipsoid_mats_buff2,
-                       nn_num,sample_size,num_quantiles,collated_dim,max_segment_index,k_neighbors,sparsity,start_ind,end_ind,Npts,Nassoc,dims):
-                            
-    EPS = 1e-10
-    written_assoc_index = 0
-    for n in range(start_ind,end_ind):
-        numtasks = 3
-        for tasknum in range(numtasks): # tasknum = 0 is random sampling, tasknum = 1 is nearest-neighbor calculation
-            if tasknum == 0:
-                sampling_buff[:sample_size] = np.random.choice(Npts, sample_size) # kwarg replace=True to save time
-                reduced_sampling_buff[:sample_size] = sampling_buff[:sample_size]
-                on_sampling_index = int(sample_size)
-                ref_pts_buff[:] = n
-            elif tasknum == 1:
-                on_sampling_index = nn_num
-                for i in range(on_sampling_index):
-                    reduced_sampling_buff[i] = nn_indices[n-start_ind,i+1]
-                    ref_pts_buff[i] = n
-                    dist_buff[i] = -1
-            else:
-                on_sampling_index = num_quantiles*(k_neighbors)*k_neighbors
-                for q in range(num_quantiles):
-                    for nn in range(k_neighbors):
-                        for myk in range(k_neighbors):
-                            buff_index = (q*k_neighbors*k_neighbors) + (nn*k_neighbors) + myk
-                            ref_pts_buff[buff_index] = nn_indices[n-start_ind,nn+1]
-                            reduced_sampling_buff[buff_index] = indices[n-start_ind,myk+1,q]
-                            dist_buff[buff_index] = -1
-                  
-            my_sample_size = on_sampling_index
-            
-            for myk in range(my_sample_size):
-                ref_pts = ref_pts_buff[myk]
-                other_pts = reduced_sampling_buff[myk]
-                if myk == 0 or ref_pts != ref_pts_buff[myk-1]:
-                    manifold_vecs_buff1[:,:] = manifold_vecs[ref_pts,:,:]
-                    manifold_coldims_buff1[:] = manifold_coldims[ref_pts,:]
-                    inv_ellipsoid_mats_buff1[:,:] = inv_ellipsoid_mats[ref_pts,:,:]
-                if myk == 0 or other_pts != reduced_sampling_buff[myk-1]:
-                    manifold_vecs_buff2[:,:] = manifold_vecs[other_pts,:,:]
-                    manifold_coldims_buff2[:] = manifold_coldims[other_pts,:]
-                    inv_ellipsoid_mats_buff2[:,:] = inv_ellipsoid_mats[other_pts,:,:]
-                    
-                use_dim_index = 0
-                otherpt_local_coll_index = local_coll_indices[other_pts]
-                otherpt_seg_assignment = seg_assignments[other_pts]
-                refpt_local_coll_index = local_coll_indices[ref_pts]
-                refpt_seg_assignment = seg_assignments[ref_pts]
-                
-                n_seg_ind = pts_seg_starts[refpt_seg_assignment] + otherpt_seg_assignment - int(refpt_seg_assignment<otherpt_seg_assignment)
-                other_pts_seg_ind =  pts_seg_starts[otherpt_seg_assignment] + refpt_seg_assignment - int(otherpt_seg_assignment<refpt_seg_assignment)
-            
-                if otherpt_seg_assignment < refpt_seg_assignment:
-                    diff_buff[:collated_dim] = collated_Xpts[n_seg_ind,2:]-collated_Xpts[otherpt_local_coll_index,2:]
-                    diff_buff[collated_dim:(2*collated_dim)] = collated_Xpts[refpt_local_coll_index,2:]-collated_Xpts[other_pts_seg_ind,2:]
-                    for d in range(collated_dim):
-                        tmp_coldim_lookup[d] =  (collated_dim*otherpt_seg_assignment) + d
-                        tmp_coldim_lookup[collated_dim + d] = (collated_dim*refpt_seg_assignment) + d
-                    use_dim_index = 2*collated_dim
-                elif otherpt_seg_assignment > refpt_seg_assignment:
-                    diff_buff[:collated_dim] = collated_Xpts[refpt_local_coll_index,2:] - collated_Xpts[other_pts_seg_ind,2:]
-                    diff_buff[collated_dim:(2*collated_dim)] = collated_Xpts[n_seg_ind,2:] - collated_Xpts[otherpt_local_coll_index,2:]
-                    for d in range(collated_dim):
-                        tmp_coldim_lookup[d] = (collated_dim*refpt_seg_assignment) + d
-                        tmp_coldim_lookup[collated_dim + d] = (collated_dim*otherpt_seg_assignment) + d
-                    use_dim_index = 2*collated_dim
-                else:
-                    diff_buff[:collated_dim] = collated_Xpts[refpt_local_coll_index,2:]-collated_Xpts[otherpt_local_coll_index,2:]
-                    for d in range(collated_dim):
-                        tmp_coldim_lookup[d] = (collated_dim*refpt_seg_assignment) + d
-                    use_dim_index = int(collated_dim)
-                                
-                diff_buff[use_dim_index:(use_dim_index + collated_dim)] = collated_Xpts[global_coll_indices[ref_pts],2:]-collated_Xpts[global_coll_indices[other_pts],2:]
-                for d in range(collated_dim):
-                    tmp_coldim_lookup[use_dim_index+d] = ((max_segment_index+1)*collated_dim) + d
-                use_dim_index += collated_dim
-
-                norm_diff = LA.norm(diff_buff[:use_dim_index])
-                sqdiff = norm_diff*norm_diff
-                    
-                if norm_diff > 0.0:
-                    Mi_xvec[:] = 0.0
-                    Mj_xvec[:] = 0.0
-                    for d1 in range(dims):
-                        diff_d_eig = 0
-                        ref_d_eig = 0
-                        dotprod = 0.0
-                        while diff_d_eig < use_dim_index and ref_d_eig < collated_dim:
-                            if manifold_coldims_buff1[ref_d_eig] == tmp_coldim_lookup[diff_d_eig]:
-                                dotprod += manifold_vecs_buff1[d1,ref_d_eig]*diff_buff[diff_d_eig]
-                                ref_d_eig += 1
-                                diff_d_eig += 1
-                            elif manifold_coldims_buff1[ref_d_eig] < tmp_coldim_lookup[diff_d_eig]:
-                                ref_d_eig += 1
-                            else:
-                                diff_d_eig += 1
-                        Mi_xvec[:] += dotprod*manifold_vecs_buff1[d1,:]
-                    
-                        diff_d_eig = 0
-                        other_d_eig = 0
-                        dotprod = 0.0
-                        while diff_d_eig < use_dim_index and other_d_eig < collated_dim:
-                            if manifold_coldims_buff2[other_d_eig] == tmp_coldim_lookup[diff_d_eig]:
-                                dotprod += manifold_vecs_buff2[d1,other_d_eig]*diff_buff[diff_d_eig]
-                                other_d_eig += 1
-                                diff_d_eig += 1
-                            elif manifold_coldims_buff2[other_d_eig] < tmp_coldim_lookup[diff_d_eig]:
-                                other_d_eig += 1
-                            else:
-                                diff_d_eig += 1
-                        Mj_xvec[:] += dotprod*manifold_vecs_buff2[d1,:]
-                    
-                    xhat_MiT_Mj_xhat = 0.0
-                    ref_d_eig = 0
-                    other_d_eig = 0
-                    while ref_d_eig < collated_dim and other_d_eig < collated_dim:
-                        if manifold_coldims_buff1[ref_d_eig] == manifold_coldims_buff2[other_d_eig]:
-                            xhat_MiT_Mj_xhat += (Mi_xvec[ref_d_eig]/norm_diff)*(Mj_xvec[other_d_eig]/norm_diff)
-                            other_d_eig += 1
-                            ref_d_eig += 1
-                        elif manifold_coldims_buff2[other_d_eig] < manifold_coldims_buff1[ref_d_eig]:
-                            other_d_eig += 1
-                        else:
-                            ref_d_eig += 1
-                    
-                    xhat_MiT_Mi_xhat = LA.norm(Mi_xvec/norm_diff)**2
-                    xhat_MjT_Mj_xhat = LA.norm(Mj_xvec/norm_diff)**2
-                    
-                    if xhat_MiT_Mj_xhat > 0.0 and xhat_MjT_Mj_xhat == xhat_MiT_Mj_xhat or xhat_MiT_Mi_xhat == xhat_MiT_Mj_xhat:
-                        alpha = 0.5*norm_diff
-                        beta = 0.5*norm_diff
-                    else:
-                        xhat_MiT_Mi_xhat += EPS
-                        xhat_MjT_Mj_xhat += EPS
-                        alpha = norm_diff*(1.0 - (xhat_MiT_Mj_xhat/xhat_MiT_Mi_xhat))/(1.0 - (xhat_MiT_Mj_xhat**2)/(xhat_MiT_Mi_xhat*xhat_MjT_Mj_xhat))
-                        beta = norm_diff*(1.0 - (xhat_MiT_Mj_xhat/xhat_MjT_Mj_xhat))/(1.0 - (xhat_MiT_Mj_xhat**2)/(xhat_MiT_Mi_xhat*xhat_MjT_Mj_xhat))
-                    
-                    myalphasqdist = 0.0
-                    mybetasqdist = 0.0
-                    myalphabetasqdist = 0.0
-                    det1 = np.power(np.abs(LA.det(inv_ellipsoid_mats_buff1[:,:])),1.0/dims)
-                    det2 = np.power(np.abs(LA.det(inv_ellipsoid_mats_buff2[:,:])),1.0/dims)
-                    diff_d_eig = 0
-                    ref_d_eig = 0
-                    other_d_eig = 0
-                    dotprod = 0.0
-                    
-                    while diff_d_eig < use_dim_index:
-                        Mi_xhat = 0.0
-                        Mj_xhat = 0.0
-                        
-                        
-                        while ref_d_eig < collated_dim and manifold_coldims[ref_pts,ref_d_eig] < tmp_coldim_lookup[diff_d_eig]:
-                            ref_d_eig += 1
-                            
-                        while other_d_eig < collated_dim and manifold_coldims[other_pts,other_d_eig] < tmp_coldim_lookup[diff_d_eig]:
-                            other_d_eig += 1
-                        
-                        if ref_d_eig < collated_dim and tmp_coldim_lookup[diff_d_eig] == manifold_coldims_buff1[ref_d_eig]:
-                            Mi_xhat = Mi_xvec[ref_d_eig]/norm_diff
-                            for d1 in range(dims):
-                                for d2 in range(dims):
-                                    myalphasqdist += alpha*Mi_xhat*manifold_vecs_buff1[d1,ref_d_eig]*inv_ellipsoid_mats_buff1[d1,d2]*manifold_vecs_buff1[d2,ref_d_eig]*Mi_xhat*alpha
-                            ref_d_eig += 1
-                            
-                        if other_d_eig < collated_dim and tmp_coldim_lookup[diff_d_eig] == manifold_coldims_buff2[other_d_eig]:
-                            Mj_xhat = Mj_xvec[other_d_eig]/norm_diff
-                            for d1 in range(dims):
-                                for d2 in range(dims):
-                                    mybetasqdist += beta*Mj_xhat*manifold_vecs_buff2[d1,other_d_eig]*inv_ellipsoid_mats_buff2[d1,d2]*manifold_vecs_buff2[d2,other_d_eig]*Mj_xhat*beta
-                            other_d_eig += 1
-                             
-                        diff_vec = diff_buff[diff_d_eig] - (alpha*Mi_xhat) - (beta*Mj_xhat)
-                        myalphabetasqdist += diff_vec*diff_vec
-                        diff_d_eig += 1
-                        
-                    dist_buff[myk] = np.sqrt(myalphasqdist) + np.sqrt(mybetasqdist) + np.sqrt(np.sqrt(det1*det2)*myalphabetasqdist)
-                else: # EDGE CASE
-                    dist_buff[myk] = 0.0
-                
-            if tasknum == 0:
-                my_sample_size = sample_size # re-set
-                sampling_buff[:sample_size] = np.argsort(dist_buff[:sample_size])
-                for q in range(num_quantiles):
-                    # assign distance quantile indices
-                    
-                    if q < num_quantiles-1:
-                        choice_start_ind = int((sample_size/(2**dims))*((q/(num_quantiles-1))**dims))
-                        choice_end_ind = int((sample_size/(2**dims))*(((q+1)/(num_quantiles-1))**dims))
-                    else:
-                        choice_start_ind = int(choice_end_ind)
-                        choice_end_ind = sample_size
-                
-                    # perform uniform sampling over indices
-                    index_incr = max(1,int((choice_end_ind-choice_start_ind)/k_neighbors))
-                    indices_buff[:k_neighbors] = sampling_buff[choice_start_ind:choice_end_ind:index_incr]
-                    indices[n-start_ind,1:(k_neighbors+1),q] = reduced_sampling_buff[indices_buff[:k_neighbors]]
-                    distances[n-start_ind,1:(k_neighbors+1),q] = dist_buff[indices_buff[:k_neighbors]]
-            elif tasknum == 1:
-                sampling_buff[:my_sample_size] = np.argsort(dist_buff[:my_sample_size])
-                nn_dists[n-start_ind,1:(my_sample_size+1)] = dist_buff[sampling_buff[:my_sample_size]]
-                for nn in range(my_sample_size):
-                    reduced_sampling_buff[nn] = nn_indices[n-start_ind,1+sampling_buff[nn]]
-                for nn in range(my_sample_size):
-                    nn_indices[n-start_ind,1+nn] = reduced_sampling_buff[nn]
-            else:
-                for q in range(num_quantiles):
-                    for myk in range(k_neighbors):
-                        nn_dist = 1.0
-                        incorp_neighbors = 0
-                        for nn in range(k_neighbors):
-                            buff_index = (q*k_neighbors*k_neighbors) + (nn*k_neighbors) + myk
-                            if dist_buff[buff_index] > 0:
-                                nn_dist *= dist_buff[buff_index]
-                                incorp_neighbors += 1
-                        if incorp_neighbors > 0 and indices[n-start_ind,1+myk,q] != n and distances[n-start_ind,1+myk,q] > 0:
-                            err_distances[n-start_ind,1+myk,q] = np.abs(np.power(nn_dist,1.0/incorp_neighbors)-distances[n-start_ind,1+myk,q])
-                        else:
-                            distances[n-start_ind,1+myk,q] = -1
-                            err_distances[n-start_ind,1+myk,q] = -1
-    
-    return
-    
-def gl_eig_decomp(norm_link_data, row_indices, col_indices, eignum, Npts, dims, twosided=False, bipartite_index=None, path=None, linop = None):
+def gl_eig_decomp(norm_link_data, row_indices, col_indices, eignum, Npts, dims, bipartite_index=None, path=None, linop = None, maxiter = None, guess_vector = None, tol = 1e-6):
     if path is None:
         path = sysOps.globaldatapath
     if linop is None:
@@ -2226,36 +1783,37 @@ def gl_eig_decomp(norm_link_data, row_indices, col_indices, eignum, Npts, dims, 
         # require complete eigen-decomposition
         sysOps.throw_status('Error: insufficient pts for eigendecomposition: ' + str(eignum) + '+2>=' + str(Npts),path)
         sysOps.exitProgram()
-        
-    if twosided:
-        sysOps.throw_status('Two-sided not supported',path)
-        sysOps.exitProgram()
-    else:
-        sysOps.throw_status('Generating ' + str(eignum) + '+1 eigenvectors ...',path)
-        
-        if eignum > 0.01*Npts:
-            try:
-                evals_large, evecs_large = scipy.sparse.linalg.eigs(linop, k=eignum+1, M = None, which='LR', v0=None, ncv=None, maxiter=None, tol = 1e-6)
-            except ArpackNoConvergence as err:
-                err_k = len(err.eigenvalues)
-                if err_k <= 0:
-                    raise AssertionError("No eigenvalues found.")
-                sysOps.throw_status('Assigning ' + str(err_k) + ' eigenvectors due to non-convergence ...',path)
-                evecs_large = np.ones([Npts,eignum+1],dtype=np.float64)/np.sqrt(Npts)
-                evecs_large[:,:err_k] = np.real(err.eigenvectors)
-                evals_large = np.ones(eignum+1,dtype=np.float64)*np.min(err.eigenvalues)
-                evals_large[:err_k] = np.real(err.eigenvalues)
-        else:
-            evals_large, evecs_large = scipy.sparse.linalg.eigs(linop, k=eignum+1, M = None, which='LR', v0=None, ncv=None, maxiter=None, tol = 1e-6)
-            
     
-        evals_large = np.real(evals_large) # set to real components
-        evecs_large = np.real(evecs_large)
-        # Since power method may not return eigenvectors in correct order, sort
-        triv_eig_index = np.argmin(np.var(evecs_large,axis = 0))
-        top_nontriv_indices = np.where(np.arange(evecs_large.shape[1]) != triv_eig_index)[0]
-        # remove trivial (translational) eigenvector
-        eval_order = top_nontriv_indices[np.argsort(np.abs(evals_large[top_nontriv_indices]))]
+    sysOps.throw_status('Generating ' + str(eignum) + '+1 eigenvectors ...',path)
+    
+    try:
+        if guess_vector is not None: # multiple guesses
+            all_evecs = scipy.linalg.qr(scipy.sparse.linalg.eigs(linop, k=eignum+1, M = None, which='LR', v0=guess_vector, ncv=None, maxiter=maxiter, tol = tol)[1],mode='economic')[0] # orthonormal vectors
+            innerprod = all_evecs.T.dot(linop.dot(all_evecs))
+            evals,evecs = LA.eig(innerprod)
+            eval_order = np.argsort(np.abs(np.real(evals)))[:(1+eignum)]
+            evecs = np.real(evecs[:,eval_order])
+            evecs_large = all_evecs.dot(evecs)
+            evals_large = evals[eval_order]
+        else:
+            evals_large, evecs_large = scipy.sparse.linalg.eigs(linop, k=eignum+1, M = None, which='LR', v0=None, ncv=None, maxiter=maxiter, tol = tol)
+    except ArpackNoConvergence as err:
+        err_k = len(err.eigenvalues)
+        if err_k <= 0:
+            raise AssertionError("No eigenvalues found.")
+        sysOps.throw_status('Assigning ' + str(err_k) + ' eigenvectors due to non-convergence ...',path)
+        evecs_large = np.ones([Npts,eignum+1],dtype=np.float64)/np.sqrt(Npts)
+        evecs_large[:,:err_k] = np.real(err.eigenvectors)
+        evals_large = np.ones(eignum+1,dtype=np.float64)*np.min(err.eigenvalues)
+        evals_large[:err_k] = np.real(err.eigenvalues)
+
+    evals_large = np.real(evals_large) # set to real components
+    evecs_large = np.real(evecs_large)
+    # Since power method may not return eigenvectors in correct order, sort
+    triv_eig_index = np.argmin(np.var(evecs_large,axis = 0))
+    top_nontriv_indices = np.where(np.arange(evecs_large.shape[1]) != triv_eig_index)[0]
+    # remove trivial (translational) eigenvector
+    eval_order = top_nontriv_indices[np.argsort(np.abs(evals_large[top_nontriv_indices]))]
     evals_large = evals_large[eval_order]
     evecs_large = evecs_large[:,eval_order]
     evals_large[:eignum]
@@ -2264,20 +1822,90 @@ def gl_eig_decomp(norm_link_data, row_indices, col_indices, eignum, Npts, dims, 
     sysOps.throw_status('Done. Removed LR trivial index ' + str(triv_eig_index))
     
     return evals_large, evecs_large
+
+def reindex_input_files(bipartite_data,path):
+        
+    attr_fields = int(sysOps.sh("head -1 " + path +  "link_assoc.txt").strip('\n').count(','))+1
+    value_fields = ''.join([(' \",\" $' + str(i)) for i in range(4,attr_fields+1)])
     
+    # re-index
+    if not bipartite_data:
+        os.rename(path + 'link_assoc.txt',path + 'orig_link_assoc.txt')
+        sysOps.sh("awk -F, '{print $1 \",\" $3 \",\" $2" + value_fields + "}' " + path + "orig_link_assoc.txt > " + path + "recol_orig_link_assoc.txt")
+        sysOps.sh("cat " + path + "orig_link_assoc.txt " + path + "recol_orig_link_assoc.txt > " + path + "link_assoc.txt")
+        
+    sysOps.big_sort(" -k2,2 -t \",\" ","link_assoc.txt","link_assoc_sort_pts1.txt",path)
+    sysOps.sh("awk -F, 'BEGIN{prev_clust_index=-1;prev_GSEobj_index=-1;max_link_ind=-1;}"
+              + "{if(prev_clust_index!=$2){prev_clust_index=$2;prev_GSEobj_index++;"
+              + " print \"0,\" prev_clust_index \",\" prev_GSEobj_index > (\"" +  path + "index_key.txt\");}"
+              + " print $1  \",\" prev_GSEobj_index  \",\" $3  " + value_fields + " > (\"" +  path + "tmp_link_assoc_sort_pts1.txt\");if($1>max_linktype_ind)max_linktype_ind=$1;}"
+              + "END{print prev_GSEobj_index+1 \",\" max_linktype_ind > (\"" +  path + "sort1_stats.txt\");}' "
+              + path + "link_assoc_sort_pts1.txt")
+    os.remove(path + "link_assoc_sort_pts1.txt")
+    # index_key has columns:
+    # 1. pts type (0 or 1)
+    # 2. pts cluster index (sorted lexicographically)
+    # 3. pts GSEobj index (consecutive from 0)
+    
+    sort1_stats = sysOps.sh("tail -1 " + path + "sort1_stats.txt").strip('\n')
+    tot_pts1 = int(sort1_stats.split(',')[0])
+    max_linktype_ind = int(sort1_stats.split(',')[1])
+    
+    if bipartite_data:
+        init_linkcount_str = ''.join([("linkcount" + str(link_ind) + "=0;assoccount" + str(link_ind) + "=0;")
+                                     for link_ind in range(2,max_linktype_ind+1)])
+        update_linkcount_str = ''.join(["if($1==" + str(link_ind) +  "){linkcount" + str(link_ind) + "+=$4;assoccount" + str(link_ind) + "++;}"
+                                       for link_ind in range(2,max_linktype_ind+1)])
+        output_linkcount_str = ''.join(["print " + str(link_ind) + " \",\" linkcount" + str(link_ind)
+                                       + " \",\" assoccount" + str(link_ind) + " >> \"" + path + "link_assoc_stats.txt\";"
+                                        for link_ind in range(2,max_linktype_ind+1)])
+
+        sysOps.big_sort(" -k3,3 -t \",\" ","tmp_link_assoc_sort_pts1.txt","link_assoc_sort_pts2.txt",path)
+        sysOps.sh("awk -F, 'BEGIN{" + init_linkcount_str + "prev_clust_index=-1;prev_GSEobj_index=" + str(tot_pts1-1) + ";}"
+                  + "{if(prev_clust_index!=$3){prev_clust_index=$3;prev_GSEobj_index++;"
+                  + " print \"1,\" prev_clust_index \",\" prev_GSEobj_index >> (\"" +  path + "index_key.txt\");}"
+                  + update_linkcount_str + "print($1  \",\" $2  \",\" prev_GSEobj_index " + value_fields + ") > (\"" +  path + "link_assoc_reindexed.txt\");}"
+                  + "END{" + output_linkcount_str + " print prev_GSEobj_index+1 > (\"" +  path + "sort2_stats.txt\");}' "
+                  + path + "link_assoc_sort_pts2.txt")
+                    
+        os.remove(path + "link_assoc_sort_pts2.txt")
+        sort2_stats = sysOps.sh("tail -1 " + path + "sort2_stats.txt").strip('\n')
+    
+        tot_pts2 = int(sort2_stats)-tot_pts1
+    else:
+        index_key = np.loadtxt(path + "index_key.txt",dtype=np.int64,delimiter=',')
+        index_key_dict = dict()
+        for n in range(index_key.shape[0]):
+            index_key_dict[index_key[n,1]] = index_key[n,2]
+        orig_link_assoc = np.loadtxt(path + 'orig_link_assoc.txt',dtype=np.float64,delimiter=',')
+        for i in range(orig_link_assoc.shape[0]):
+            orig_link_assoc[i,1] = index_key_dict[int(orig_link_assoc[i,1])]
+            orig_link_assoc[i,2] = index_key_dict[int(orig_link_assoc[i,2])]
+        np.savetxt(path + "link_assoc_reindexed.txt",orig_link_assoc,fmt='%i,%i,%i,' + ','.join(['%.10e']*(attr_fields-3)),delimiter = ',')
+    
+    with open(path + "link_assoc_stats.txt",'a') as statsfile:
+        statsfile.write('0,' + str(tot_pts1) + '\n')
+        if bipartite_data:
+            statsfile.write('1,' + str(tot_pts2))
+    Npt_tp1 = int(tot_pts1)
+    if bipartite_data:
+        Npt_tp2 = int(tot_pts2)
+    else:
+        os.remove(path + "link_assoc.txt")
+        os.rename(path + 'orig_link_assoc.txt',path + 'link_assoc.txt')
+        Npt_tp2 = 0
+                    
+    return Npt_tp1, Npt_tp2
         
 class GSEobj:
     # object for all image inference
     
-    def __init__(self,inference_dim=None,inference_eignum=None,bipartite_data=True,gamma=None,inp_path=""):
+    def __init__(self,inference_dim=None,inference_eignum=None,bipartite_data=True,inp_path=""):
         # if constructor has been called, it's assumed that link_assoc.txt is in present directory with original indices
         # we first want
         self.num_workers = None
-        self.seq_evecs = None
         self.index_key = None
-        self.scale_boundaries = None
         self.matres = None
-        self.assoc_lengthscale = None
         self.bipartite_data = bipartite_data
         self.link_data = None
         self.pseudolink_data = None
@@ -2289,22 +1917,21 @@ class GSEobj:
         self.print_status = True
         self.subsample_pairings = None
         self.subsample_pairing_weights = None
+        self.seq_evecs = None
         self.shm_dict = None
         self.path = str(sysOps.globaldatapath)+inp_path
         self.isroot = False
-        self.manifold_vecs = None
-        self.manifold_coldims = None
-        self.inv_ellipsoid_mats = None
-        self.seg_assignments = None
-        self.quantile_assoc_weights = None
+        self.shortest_paths_dists = None
+        self.nn_mat = None
+        self.scales = [1,None]
         
+        self.seg_assignments = None
         self.pts_seg_starts = None
         self.collated_Xpts = None
         self.argsort_solns = None
         self.soln_starts = None
         
         self.max_segment_index = None
-        self.ellipsoid_mats = None
         self.nn_indices = None
         self.global_coll_indices = None
         self.local_coll_indices = None
@@ -2335,10 +1962,6 @@ class GSEobj:
         else:
             self.inference_eignum = int(inference_eignum)
         
-        if gamma is None:
-            self.gamma = None
-        else:
-            self.gamma = float(gamma)
         # counts and indices in inp_data, if this is included in input, take precedence over read-in numbers from inp_settings and imagemodule_input_filename
         
         self.load_data() # requires inputted value of Npt_tp1 if inp_data = None
@@ -2347,7 +1970,16 @@ class GSEobj:
         for key in self.shm_dict:
             if type(self.shm_dict[key]) == list:
                 for myshm in self.shm_dict[key]:
-                    if myshm is not None:
+                    if type(myshm) == dict:
+                        for dict_el in myshm:
+                            myshm[dict_el].close()
+                            if self.isroot:
+                                myshm[dict_el].unlink()
+                                try:
+                                    sysOps.sh('rm /dev/shm/' + myshm[dict_el].name) # only valid for linux os
+                                except:
+                                    pass
+                    elif myshm is not None:
                         myshm.close()
                         if self.isroot:
                             myshm.unlink()
@@ -2355,6 +1987,16 @@ class GSEobj:
                                 sysOps.sh('rm /dev/shm/' + myshm.name) # only valid for linux os
                             except:
                                 pass
+            elif type(self.shm_dict[key]) == dict:
+                for dict_el in self.shm_dict[key]:
+                    self.shm_dict[key][dict_el].close()
+                    if self.isroot:
+                        self.shm_dict[key][dict_el].unlink()
+                        try:
+                            sysOps.sh('rm /dev/shm/' + self.shm_dict[key][dict_el].name) # only valid for linux os
+                        except:
+                            pass
+                
             elif self.shm_dict[key] is not None:
                 self.shm_dict[key].close()
                 if self.isroot:
@@ -2374,45 +2016,45 @@ class GSEobj:
             for child in active:
                 child.terminate()
             
-    def deliver_handshakes(self,instruction,division_indices,division_setsizes,worker_proc_indices,merge_prefixes=[],max_simultaneous_div=1,root_delete=True,set_weights=None):
-        # division_setsizes = None means only 1 worker_process will be assigned per division
+    def deliver_handshakes(self,instruction,tessellation_indices,tessellation_setsizes,worker_proc_indices,merge_prefixes=[],max_simultaneous_tess=1,root_delete=True,set_weights=None):
+        # tessellation_setsizes = None means only 1 worker_process will be assigned per tessellation
         sysOps.throw_status('Delivering handshakes for instruction: ' + instruction)
         
         worker_proc_list = list()
-        division_list = list()
-        division_segsizes_list = list()
-        if division_setsizes is not None:
-            for division_ind, i in zip(division_indices,range(division_indices.shape[0])):
+        tessellation_list = list()
+        tessellation_segsizes_list = list()
+        if tessellation_setsizes is not None:
+            for tessellation_ind, i in zip(tessellation_indices,range(tessellation_indices.shape[0])):
                 for worker_proc in worker_proc_indices:
                     worker_proc_list.append(int(worker_proc))
-                    division_list.append(int(division_ind))
-                    division_segsizes_list.append(int(division_setsizes[i]))
+                    tessellation_list.append(int(tessellation_ind))
+                    tessellation_segsizes_list.append(int(tessellation_setsizes[i]))
         else:
-            for i in range(division_indices.shape[0]):
-                worker_proc_list.append(int(worker_proc_indices[i%min(max_simultaneous_div,worker_proc_indices.shape[0])]))
-                division_list.append(int(division_indices[i]))
-                division_segsizes_list.append(0)
+            for i in range(tessellation_indices.shape[0]):
+                worker_proc_list.append(int(worker_proc_indices[i%min(max_simultaneous_tess,worker_proc_indices.shape[0])]))
+                tessellation_list.append(int(tessellation_indices[i]))
+                tessellation_segsizes_list.append(0)
                                                
         worker_proc_list = np.array(worker_proc_list)
-        division_list = np.array(division_list)
-        unique_divisions = np.sort(np.unique(division_list))
-        division_segsizes_list = np.array(division_segsizes_list)
-        list_order = np.argsort(division_list)
+        tessellation_list = np.array(tessellation_list)
+        unique_tessellations = np.sort(np.unique(tessellation_list))
+        tessellation_segsizes_list = np.array(tessellation_segsizes_list)
+        list_order = np.argsort(tessellation_list)
         
-        # order queue by division index
+        # order queue by tessellation index
         worker_proc_list = worker_proc_list[list_order]
-        division_list = division_list[list_order]
-        division_segsizes_list = division_segsizes_list[list_order]
-        div_starts = np.append(np.append(0,1+np.where(np.diff(division_list)>0)[0]), division_list.shape[0])
+        tessellation_list = tessellation_list[list_order]
+        tessellation_segsizes_list = tessellation_segsizes_list[list_order]
+        tess_starts = np.append(np.append(0,1+np.where(np.diff(tessellation_list)>0)[0]), tessellation_list.shape[0])
                                         
         bounds = list([0])
-        if division_setsizes is not None:
-            for div in range(div_starts.shape[0]-1):
-                start = div_starts[div]
-                end = div_starts[div+1]
-                my_division_set_size = division_segsizes_list[start]
+        if tessellation_setsizes is not None:
+            for tess in range(tess_starts.shape[0]-1):
+                start = tess_starts[tess]
+                end = tess_starts[tess+1]
+                my_tessellation_set_size = tessellation_segsizes_list[start]
                 for i in range(1,end-start+1):
-                    bounds.append(int((my_division_set_size*i)/(end-start)))
+                    bounds.append(int((my_tessellation_set_size*i)/(end-start)))
     
         if set_weights is not None:
             tot_bounds = len(bounds)
@@ -2427,235 +2069,230 @@ class GSEobj:
         bounds = bounds[:(len(bounds)-1)]
         
         # await completion: keep track of in which directories processing is ongoing so that these data can be loaded
-        num_workers_in_each_div = np.zeros(unique_divisions.shape[0],dtype=np.int64)
+        num_workers_in_each_tess = np.zeros(unique_tessellations.shape[0],dtype=np.int64)
         on_handshake_index = 0
-        while on_handshake_index < worker_proc_list.shape[0] or (on_handshake_index == worker_proc_list.shape[0] and np.sum(num_workers_in_each_div > 0) > 0):
+        while on_handshake_index < worker_proc_list.shape[0] or (on_handshake_index == worker_proc_list.shape[0] and np.sum(num_workers_in_each_tess > 0) > 0):
             [dirnames,filenames] = sysOps.get_directory_and_file_list()
-            num_workers_in_each_div[:] = 0
+            num_workers_in_each_tess[:] = 0
             for filename in filenames:
                 if 'handshake' in filename:
-                    num_workers_in_each_div[unique_divisions==int(filename.split('~')[2])] += 1
+                    num_workers_in_each_tess[unique_tessellations==int(filename.split('~')[2])] += 1
                     if filename.startswith("__handshake"):
                         os.remove(sysOps.globaldatapath + filename)
             
             if root_delete:
-                for div in unique_divisions: # clean up
-                    if np.sum(division_list[on_handshake_index:] == div) == 0 and num_workers_in_each_div[unique_divisions==div] == 0:
+                for tess in unique_tessellations: # clean up
+                    if np.sum(tessellation_list[on_handshake_index:] == tess) == 0 and num_workers_in_each_tess[unique_tessellations==tess] == 0:
                         # if there are devisions that have been closed that will not be re-used, delete from RAM
                         for key in self.shm_dict:
-                            if type(self.shm_dict[key]) == list and len(self.shm_dict[key]) > div-1 and self.shm_dict[key][div-1] is not None:
-                                self.shm_dict[key][div-1].close()
-                                self.shm_dict[key][div-1].unlink()
-                                try:
-                                    sysOps.sh('rm /dev/shm/' + self.shm_dict[key][div-1].name) # only valid for linux os
-                                except:
-                                    pass
-                                self.shm_dict[key][div-1] = None
-                                self.unload_shared_data_from_lists(div-1)
+                            if type(self.shm_dict[key]) == list and len(self.shm_dict[key]) > tess-1 and self.shm_dict[key][tess-1] is not None:
+                                if type(self.shm_dict[key][tess-1]) == dict:
+                                    for dict_el in self.shm_dict[key][tess-1]:
+                                        self.shm_dict[key][tess-1][dict_el].close()
+                                        self.shm_dict[key][tess-1][dict_el].unlink()
+                                        try:
+                                            sysOps.sh('rm /dev/shm/' + self.shm_dict[key][tess-1][dict_el].name) # only valid for linux os
+                                        except:
+                                            pass
+                                else:
+                                    self.shm_dict[key][tess-1].close()
+                                    self.shm_dict[key][tess-1].unlink()
+                                    try:
+                                        sysOps.sh('rm /dev/shm/' + self.shm_dict[key][tess-1].name) # only valid for linux os
+                                    except:
+                                        pass
+                                self.shm_dict[key][tess-1] = None
+                                self.unload_shared_data_from_lists(tess-1)
                         
-            if on_handshake_index < worker_proc_list.shape[0] and (np.sum(num_workers_in_each_div > 0) < max_simultaneous_div or (np.sum(num_workers_in_each_div > 0) == max_simultaneous_div and num_workers_in_each_div[unique_divisions==division_list[on_handshake_index]] > 0)) and np.sum(num_workers_in_each_div) < worker_proc_indices.shape[0]:
+            if on_handshake_index < worker_proc_list.shape[0] and (np.sum(num_workers_in_each_tess > 0) < max_simultaneous_tess or (np.sum(num_workers_in_each_tess > 0) == max_simultaneous_tess and num_workers_in_each_tess[unique_tessellations==tessellation_list[on_handshake_index]] > 0)) and np.sum(num_workers_in_each_tess) < worker_proc_indices.shape[0]:
                 
-                handshake_filename = 'handshake~' + str(worker_proc_list[on_handshake_index]) + '~' + str(division_list[on_handshake_index])
-                divdir = 'div' + str(division_list[on_handshake_index]) + '//'
-                if num_workers_in_each_div[unique_divisions==division_list[on_handshake_index]] == 0:
-                    self.load_shared_data_to_lists(division_list[on_handshake_index]-1)
+                handshake_filename = 'handshake~' + str(worker_proc_list[on_handshake_index]) + '~' + str(tessellation_list[on_handshake_index])
+                tessdir = 'tess' + str(tessellation_list[on_handshake_index]) + '//'
+                if num_workers_in_each_tess[unique_tessellations==tessellation_list[on_handshake_index]] == 0:
+                    self.load_shared_data_to_lists(tessellation_list[on_handshake_index]-1)
                     try:
-                        os.mkdir(sysOps.globaldatapath + divdir)
-                        os.mkdir(sysOps.globaldatapath + divdir + 'tmp')
-                        sysOps.sh('cp -p ' + sysOps.globaldatapath + 'link_assoc_stats.txt ' +sysOps.globaldatapath + divdir + "link_assoc_stats.txt")
+                        os.mkdir(sysOps.globaldatapath + tessdir)
+                        os.mkdir(sysOps.globaldatapath + tessdir + 'tmp')
+                        sysOps.sh('cp -p ' + sysOps.globaldatapath + 'link_assoc_stats.txt ' +sysOps.globaldatapath + tessdir + "link_assoc_stats.txt")
                     except:
                         pass
-                    self.move_to_shared_memory([divdir],assume_no_prev_link=False) # first process in this division
+                    self.move_to_shared_memory([tessdir],assume_no_prev_link=False) # first process in this tessellation
                 with open(sysOps.globaldatapath + handshake_filename,'w') as handshake_file:
                     sysOps.throw_status('Writing ' + sysOps.globaldatapath + handshake_filename)
-                    handshake_file.write('divdir,' + divdir + '\n')
-                    if division_setsizes is None:
+                    handshake_file.write('tessdir,' + tessdir + '\n')
+                    if tessellation_setsizes is None:
                         handshake_file.write(instruction)
                     else:
                         handshake_file.write(instruction + ',' + bounds[on_handshake_index])
-                    num_workers_in_each_div[unique_divisions==division_list[on_handshake_index]] += 1
+                    num_workers_in_each_tess[unique_tessellations==tessellation_list[on_handshake_index]] += 1
                 on_handshake_index += 1
             else:
                 time.sleep(0.5)
                 
-        if division_setsizes is not None:
-            for division_ind in division_indices:
+        if tessellation_setsizes is not None:
+            for tessellation_ind in tessellation_indices:
                 for merge_prefix in merge_prefixes:
-                    [dirnames,filenames] = sysOps.get_directory_and_file_list(sysOps.globaldatapath + "div" + str(division_ind) + "//")
-                    file_list = [sysOps.globaldatapath + "div" + str(division_ind) + "//" + filename for filename in filenames if filename.startswith(merge_prefix)]
+                    [dirnames,filenames] = sysOps.get_directory_and_file_list(sysOps.globaldatapath + "tess" + str(tessellation_ind) + "//")
+                    file_list = [sysOps.globaldatapath + "tess" + str(tessellation_ind) + "//" + filename for filename in filenames if filename.startswith(merge_prefix)]
                     file_indices = np.argsort(np.array([int(filename.split('~')[1]) for filename in file_list]))
-                    sysOps.sh('cat ' + ' '.join([file_list[i] for i in file_indices]) + ' > ' + sysOps.globaldatapath + "div" + str(division_ind) + '//' + merge_prefix + '.txt')
+                    sysOps.sh('cat ' + ' '.join([file_list[i] for i in file_indices]) + ' > ' + sysOps.globaldatapath + "tess" + str(tessellation_ind) + '//' + merge_prefix + '.txt')
                     sysOps.sh("rm " + ' '.join(file_list)) # clean up
         sysOps.throw_status('Handshakes delivered for instruction: ' + instruction)
         
         if root_delete:
-            for div in unique_divisions: # clean up
+            for tess in unique_tessellations: # clean up
                 for key in self.shm_dict:
-                    if type(self.shm_dict[key]) == list and len(self.shm_dict[key]) > div-1 and self.shm_dict[key][div-1] is not None:
-                        self.shm_dict[key][div-1].close()
-                        self.shm_dict[key][div-1].unlink()
-                        try:
-                            sysOps.sh('rm /dev/shm/' + self.shm_dict[key][div-1].name) # only valid for linux os
-                        except:
-                            pass
-                        self.shm_dict[key][div-1] = None
-                        self.unload_shared_data_from_lists(div-1)
+                    if type(self.shm_dict[key]) == list and len(self.shm_dict[key]) > tess-1 and self.shm_dict[key][tess-1] is not None:
+                        if type(self.shm_dict[key][tess-1]) == dict:
+                            for dict_el in self.shm_dict[key][tess-1]:
+                                self.shm_dict[key][tess-1][dict_el].close()
+                                self.shm_dict[key][tess-1][dict_el].unlink()
+                                try:
+                                    sysOps.sh('rm /dev/shm/' + self.shm_dict[key][tess-1][dict_el].name) # only valid for linux os
+                                except:
+                                    pass
+                        else:
+                            self.shm_dict[key][tess-1].close()
+                            self.shm_dict[key][tess-1].unlink()
+                            try:
+                                sysOps.sh('rm /dev/shm/' + self.shm_dict[key][tess-1].name) # only valid for linux os
+                            except:
+                                pass
+                        self.shm_dict[key][tess-1] = None
+                        self.unload_shared_data_from_lists(tess-1)
                 
         return
         
-    def load_shared_data_to_lists(self,div_index):
+    def load_shared_data_to_lists(self,tess_index):
         
-        divdir = "div" + str(div_index+1) + '//'
+        tessdir = "tess" + str(tess_index+1) + '//'
                 
-        if sysOps.check_file_exists(divdir + "manifold_vecs.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "manifold_vecs.txt")
-            if self.manifold_vecs is None:
-                self.manifold_vecs = list()
-            while len(self.manifold_vecs) <= div_index + 1:
-                self.manifold_vecs.append(None)
-            if self.manifold_vecs[div_index] is None:
-                self.manifold_vecs[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'manifold_vecs.txt',delimiter=',',dtype=np.float64).reshape([self.Npts,self.spat_dims,self.inference_eignum])
+        if sysOps.check_file_exists(tessdir + "nn_mat.npz"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "nn_mat.npz")
+            if self.nn_mat is None:
+                self.nn_mat = list()
+            while len(self.nn_mat) <= tess_index + 1:
+                self.nn_mat.append(None)
+            if self.nn_mat[tess_index] is None:
+                self.nn_mat[tess_index] = load_npz(sysOps.globaldatapath + tessdir + 'nn_mat.npz')
+
+        if sysOps.check_file_exists(tessdir + "shortest_paths_dists.npy"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "shortest_paths_dists.npy")
+            if self.shortest_paths_dists is None:
+                self.shortest_paths_dists = list()
+            while len(self.shortest_paths_dists) <= tess_index + 1:
+                self.shortest_paths_dists.append(None)
+            if self.shortest_paths_dists[tess_index] is None:
+                self.shortest_paths_dists[tess_index] = np.load(sysOps.globaldatapath + tessdir + 'shortest_paths_dists.npy')
         
-        if sysOps.check_file_exists(divdir + "manifold_coldims.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "manifold_coldims.txt")
-            if self.manifold_coldims is None:
-                self.manifold_coldims = list()
-            while len(self.manifold_coldims) <= div_index + 1:
-                self.manifold_coldims.append(None)
-            if self.manifold_coldims[div_index] is None:
-                self.manifold_coldims[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'manifold_coldims.txt',delimiter=',',dtype=np.int64).reshape([self.Npts,self.inference_eignum])
-                                                    
-        if sysOps.check_file_exists(divdir + "reindexed_Xpts_segment_None.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "reindexed_Xpts_segment_None.txt")
+        if sysOps.check_file_exists(tessdir + "reindexed_Xpts_segment_None.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "reindexed_Xpts_segment_None.txt")
             if self.seg_assignments is None:
                 self.seg_assignments = list()
-            while len(self.seg_assignments) <= div_index + 1:
+            while len(self.seg_assignments) <= tess_index + 1:
                 self.seg_assignments.append(None)
-            if self.seg_assignments[div_index] is None:
-                self.seg_assignments[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'reindexed_Xpts_segment_None.txt',delimiter=',',dtype=np.int64)
+            if self.seg_assignments[tess_index] is None:
+                self.seg_assignments[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'reindexed_Xpts_segment_None.txt',delimiter=',',dtype=np.int64)
                                                      
-        if sysOps.check_file_exists(divdir + "sorted_collated_Xpts.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "sorted_collated_Xpts.txt")
+        if sysOps.check_file_exists(tessdir + "sorted_collated_Xpts.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "sorted_collated_Xpts.txt")
             if self.collated_Xpts is None:
                 self.collated_Xpts = list()
-            while len(self.collated_Xpts) <= div_index + 1:
+            while len(self.collated_Xpts) <= tess_index + 1:
                 self.collated_Xpts.append(None)
-            if self.collated_Xpts[div_index] is None:
-                self.collated_Xpts[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'sorted_collated_Xpts.txt',delimiter=',',dtype=np.float64)
+            if self.collated_Xpts[tess_index] is None:
+                self.collated_Xpts[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'sorted_collated_Xpts.txt',delimiter=',',dtype=np.float64)
             
-        if sysOps.check_file_exists(divdir + "ellipsoid_mats.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "ellipsoid_mats.txt")
-            if self.ellipsoid_mats is None:
-                self.ellipsoid_mats = list()
-            while len(self.ellipsoid_mats) <= div_index + 1:
-                self.ellipsoid_mats.append(None)
-            if self.ellipsoid_mats[div_index] is None:
-                self.ellipsoid_mats[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'ellipsoid_mats.txt',delimiter=',',dtype=np.float64).reshape([self.Npts,self.spat_dims,self.spat_dims])
-                                                                
-        if sysOps.check_file_exists(divdir + "inv_ellipsoid_mats.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "inv_ellipsoid_mats.txt")
-            if self.inv_ellipsoid_mats is None:
-                self.inv_ellipsoid_mats = list()
-            while len(self.inv_ellipsoid_mats) <= div_index+1:
-                self.inv_ellipsoid_mats.append(None)
-            if self.inv_ellipsoid_mats[div_index] is None:
-                self.inv_ellipsoid_mats[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'inv_ellipsoid_mats.txt',delimiter=',',dtype=np.float64).reshape([self.Npts,self.spat_dims,self.spat_dims])
-            
-        if sysOps.check_file_exists(divdir + "nn_indices.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "nn_indices.txt")
+        if sysOps.check_file_exists(tessdir + "nn_indices.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "nn_indices.txt")
             if self.nn_indices is None:
                 self.nn_indices = list()
-            while len(self.nn_indices) <= div_index + 1:
+            while len(self.nn_indices) <= tess_index + 1:
                 self.nn_indices.append(None)
-            if self.nn_indices[div_index] is None:
-                self.nn_indices[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'nn_indices.txt',delimiter=',',dtype=np.int64)
+            if self.nn_indices[tess_index] is None:
+                self.nn_indices[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'nn_indices.txt',delimiter=',',dtype=np.int64)
                                     
-        if sysOps.check_file_exists(divdir + "global_coll_indices.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "global_coll_indices.txt")
+        if sysOps.check_file_exists(tessdir + "global_coll_indices.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "global_coll_indices.txt")
             if self.global_coll_indices is None:
                 self.global_coll_indices = list()
-            while len(self.global_coll_indices) <= div_index + 1:
+            while len(self.global_coll_indices) <= tess_index + 1:
                 self.global_coll_indices.append(None)
-            if self.global_coll_indices[div_index] is None:
-                self.global_coll_indices[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'global_coll_indices.txt',delimiter=',',dtype=np.int64)
+            if self.global_coll_indices[tess_index] is None:
+                self.global_coll_indices[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'global_coll_indices.txt',delimiter=',',dtype=np.int64)
                                                 
-        if sysOps.check_file_exists(divdir + "local_coll_indices.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "local_coll_indices.txt")
+        if sysOps.check_file_exists(tessdir + "local_coll_indices.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "local_coll_indices.txt")
             if self.local_coll_indices is None:
                 self.local_coll_indices = list()
-            while len(self.local_coll_indices) <= div_index + 1:
+            while len(self.local_coll_indices) <= tess_index + 1:
                 self.local_coll_indices.append(None)
-            if self.local_coll_indices[div_index] is None:
-                self.local_coll_indices[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'local_coll_indices.txt',delimiter=',',dtype=np.int64)
+            if self.local_coll_indices[tess_index] is None:
+                self.local_coll_indices[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'local_coll_indices.txt',delimiter=',',dtype=np.int64)
                                                             
-        if sysOps.check_file_exists(divdir + "pts_seg_starts.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "pts_seg_starts.txt")
+        if sysOps.check_file_exists(tessdir + "pts_seg_starts.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "pts_seg_starts.txt")
             if self.pts_seg_starts is None:
                 self.pts_seg_starts = list()
-            while len(self.pts_seg_starts) <= div_index + 1:
+            while len(self.pts_seg_starts) <= tess_index + 1:
                 self.pts_seg_starts.append(None)
-            if self.pts_seg_starts[div_index] is None:
-                self.pts_seg_starts[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'pts_seg_starts.txt',delimiter=',',dtype=np.int64)
+            if self.pts_seg_starts[tess_index] is None:
+                self.pts_seg_starts[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'pts_seg_starts.txt',delimiter=',',dtype=np.int64)
                                                                         
-        if sysOps.check_file_exists(divdir + "argsort_solns.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "argsort_solns.txt")
+        if sysOps.check_file_exists(tessdir + "argsort_solns.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "argsort_solns.txt")
             if self.argsort_solns is None:
                 self.argsort_solns = list()
-            while len(self.argsort_solns) <= div_index + 1:
+            while len(self.argsort_solns) <= tess_index + 1:
                 self.argsort_solns.append(None)
-            if self.argsort_solns[div_index] is None:
-                self.argsort_solns[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'argsort_solns.txt',delimiter=',',dtype=np.int64)
+            if self.argsort_solns[tess_index] is None:
+                self.argsort_solns[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'argsort_solns.txt',delimiter=',',dtype=np.int64)
                                                                         
-        if sysOps.check_file_exists(divdir + "soln_starts.txt"):
-            sysOps.throw_status("Loading " + sysOps.globaldatapath + divdir + "soln_starts.txt")
+        if sysOps.check_file_exists(tessdir + "soln_starts.txt"):
+            sysOps.throw_status("Loading " + sysOps.globaldatapath + tessdir + "soln_starts.txt")
             if self.soln_starts is None:
                 self.soln_starts = list()
-            while len(self.soln_starts) <= div_index + 1:
+            while len(self.soln_starts) <= tess_index + 1:
                 self.soln_starts.append(None)
-            if self.soln_starts[div_index] is None:
-                self.soln_starts[div_index] = np.loadtxt(sysOps.globaldatapath + divdir + 'soln_starts.txt',delimiter=',',dtype=np.int64)
+            if self.soln_starts[tess_index] is None:
+                self.soln_starts[tess_index] = np.loadtxt(sysOps.globaldatapath + tessdir + 'soln_starts.txt',delimiter=',',dtype=np.int64)
             
-    def unload_shared_data_from_lists(self,div_index):
+    def unload_shared_data_from_lists(self,tess_index):
         sysOps.throw_status('Calling unload_shared_data_from_lists()')
-        if self.manifold_vecs is not None:
-            self.manifold_vecs[div_index] = None
-                                
-        if self.manifold_coldims is not None:
-            self.manifold_coldims[div_index] = None
+        
+        if self.shortest_paths_dists is not None:
+            self.shortest_paths_dists[tess_index] = None
+            
+        if self.nn_mat is not None:
+            self.nn_mat[tess_index] = None
                                             
         if self.seg_assignments is not None:
-            self.seg_assignments[div_index] = None
+            self.seg_assignments[tess_index] = None
                                                         
         if self.collated_Xpts is not None:
-            self.collated_Xpts[div_index] = None
-                                                                    
-        if self.ellipsoid_mats is not None:
-            self.ellipsoid_mats[div_index] = None
-                                                                                            
-        if self.inv_ellipsoid_mats is not None:
-            self.inv_ellipsoid_mats[div_index] = None
-                                                                                            
+            self.collated_Xpts[tess_index] = None
+                                
         if self.nn_indices is not None:
-            self.nn_indices[div_index] = None
+            self.nn_indices[tess_index] = None
                                                                                             
         if self.global_coll_indices is not None:
-            self.global_coll_indices[div_index] = None
+            self.global_coll_indices[tess_index] = None
                                                                                                         
         if self.local_coll_indices is not None:
-            self.local_coll_indices[div_index] = None
+            self.local_coll_indices[tess_index] = None
                                                                                                         
         if self.pts_seg_starts is not None:
-            self.pts_seg_starts[div_index] = None
+            self.pts_seg_starts[tess_index] = None
                                                                        
         if self.argsort_solns is not None:
-            self.argsort_solns[div_index] = None
+            self.argsort_solns[tess_index] = None
                                                                        
         if self.soln_starts is not None:
-            self.soln_starts[div_index] = None
+            self.soln_starts[tess_index] = None
                                                             
-    def move_to_shared_memory(self,divdirs,assume_no_prev_link=True):
+    def move_to_shared_memory(self,tessdirs,assume_no_prev_link=True):
     
-        sysOps.throw_status('Moving GSE object to shared memory, divdirs = ' + str(divdirs) + ' ...')
+        sysOps.throw_status('Moving GSE object to shared memory, tessdirs = ' + str(tessdirs) + ' ...')
         if self.shm_dict is not None and assume_no_prev_link:
             self.destruct_shared_mem() # in case shared memory already exists
         if self.shm_dict is None:
@@ -2687,17 +2324,6 @@ class GSEobj:
                         del tmp
                 else:
                     shm_name_file.write(key + ',' + self.shm_dict[key].name + ',' + str(np.prod(self.link_data.shape)) + '\n')
-            if self.quantile_assoc_weights is not None:
-                key = 'quantile_assoc_weights'
-                if key not in self.shm_dict:
-                    if assume_no_prev_link:
-                        tmp = np.array(self.quantile_assoc_weights)
-                        self.shm_dict[key] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.quantile_assoc_weights = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key].buf)
-                        self.quantile_assoc_weights[:] = tmp[:]
-                        del tmp
-                else:
-                    shm_name_file.write(key + ',' + self.shm_dict[key].name + ',' + str(np.prod(self.quantile_assoc_weights.shape)) + '\n')
             if self.pseudolink_data is not None:
                 key = 'pseudolink_data'
                 if key not in self.shm_dict:
@@ -2866,65 +2492,53 @@ class GSEobj:
                 else:
                     shm_name_file.write(key + ',' + self.shm_dict[key].name + ',' + str(np.prod(self.dXpts.shape)) + '\n')
                                 
-            if self.assoc_lengthscale is not None:
-                key = 'assoc_lengthscale'
-                if key not in self.shm_dict:
-                    if assume_no_prev_link:
-                        tmp = np.array(self.assoc_lengthscale)
-                        self.shm_dict[key] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.assoc_lengthscale = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key].buf)
-                        self.assoc_lengthscale[:] = tmp[:]
-                        del tmp
-                else:
-                    shm_name_file.write(key + ',' + self.shm_dict[key].name + ',' + str(np.prod(self.assoc_lengthscale.shape)) + '\n')
                             
         # Done writing common file. Copy to all directories and append as necessary ...
-        for divdir in divdirs:
-            sysOps.sh('cp -p ' + self.path + 'shared_mem_names.txt ' + self.path + divdir + 'shared_mem_names.txt')
+        for tessdir in tessdirs:
+            sysOps.sh('cp -p ' + self.path + 'shared_mem_names.txt ' + self.path + tessdir + 'shared_mem_names.txt')
         
-        if len(divdirs) > 0:
-            num_divdirs = len([dirname for dirname in sysOps.sh("ls -d " + sysOps.globaldatapath + 'div*').strip('\n').split("\n") if "div" in dirname])
-            for key in ['manifold_vecs','manifold_coldims','inv_ellipsoid_mats','seg_assignments','pts_seg_starts','argsort_solns','soln_starts','collated_Xpts','ellipsoid_mats','nn_indices','global_coll_indices','local_coll_indices']:
+        if len(tessdirs) > 0:
+            tess_indices = sorted([int(dirname[len(sysOps.globaldatapath + 'tess'):]) for dirname in sysOps.sh("ls -d " + sysOps.globaldatapath + 'tess*').strip('\n').split("\n")])
+            num_tessdirs = len(tess_indices)
+            for key in ['seg_assignments','pts_seg_starts','argsort_solns','soln_starts','collated_Xpts','nn_indices','global_coll_indices','local_coll_indices','nn_mat','shortest_paths_dists']:
+                
                 if key not in self.shm_dict:
                     self.shm_dict[key] = list()
-                for i in range(len(self.shm_dict[key]),num_divdirs):
+                for i in range(len(self.shm_dict[key]),num_tessdirs):
                     self.shm_dict[key].append(None)
-            if self.manifold_vecs is not None:
-                key = 'manifold_vecs'
-                for i in range(len(self.manifold_vecs)): # assumes list
-                    if self.manifold_vecs[i] is not None:
-                        tmp = np.array(self.manifold_vecs[i])
+                
+            if self.shortest_paths_dists is not None:
+                key = 'shortest_paths_dists'
+                for i in range(len(self.shortest_paths_dists)): # assumes list
+                    if self.shortest_paths_dists[i] is not None:
+                        tmp = np.array(self.shortest_paths_dists[i])
                         if self.shm_dict[key][i] is None:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.manifold_vecs[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
-                        self.manifold_vecs[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        self.shortest_paths_dists[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
+                        self.shortest_paths_dists[i][:] = tmp[:]
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
-            if self.manifold_coldims is not None:
-                key = 'manifold_coldims'
-                for i in range(len(self.manifold_coldims)): # assumes list
-                    if self.manifold_coldims[i] is not None:
-                        tmp = np.array(self.manifold_coldims[i])
-                        if self.shm_dict[key][i] is None:
-                            self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.manifold_coldims[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
-                        self.manifold_coldims[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
-                            shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
+                        
+            if self.nn_mat is not None:
+                for i in range(len(self.nn_mat)): # assumes list
+                    if self.nn_mat[i] is not None:
+                        tmp = csr_matrix(self.nn_mat[i])
+                        if self.shm_dict['nn_mat'][i] is None:
+                            self.shm_dict['nn_mat'][i] = dict()
+                            self.shm_dict['nn_mat'][i]['data'] = shared_memory.SharedMemory(create=True, size=tmp.data.nbytes)
+                            self.shm_dict['nn_mat'][i]['indices'] = shared_memory.SharedMemory(create=True, size=tmp.indices.nbytes)
+                            self.shm_dict['nn_mat'][i]['indptr'] = shared_memory.SharedMemory(create=True, size=tmp.indptr.nbytes)
+                        self.nn_mat[i].data = np.ndarray(tmp.data.shape, dtype=tmp.data.dtype, buffer=self.shm_dict['nn_mat'][i]['data'].buf)
+                        self.nn_mat[i].indices = np.ndarray(tmp.indices.shape, dtype=tmp.indices.dtype, buffer=self.shm_dict['nn_mat'][i]['indices'].buf)
+                        self.nn_mat[i].indptr = np.ndarray(tmp.indptr.shape, dtype=tmp.indptr.dtype, buffer=self.shm_dict['nn_mat'][i]['indptr'].buf)
+                        self.nn_mat[i].data[:] = tmp.data[:]
+                        self.nn_mat[i].indices[:] = tmp.indices[:]
+                        self.nn_mat[i].indptr[:] = tmp.indptr[:]
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
+                            shm_name_file.write('nn_mat' + ',' + self.shm_dict['nn_mat'][i]['data'].name + ',' + str(np.prod(tmp.data.shape)) + ',' + self.shm_dict['nn_mat'][i]['indices'].name + ',' + str(np.prod(tmp.indices.shape)) + ',' + self.shm_dict['nn_mat'][i]['indptr'].name + ',' + str(np.prod(tmp.indptr.shape)) + '\n')
                         del tmp
-            if self.inv_ellipsoid_mats is not None:
-                key = 'inv_ellipsoid_mats'
-                for i in range(len(self.inv_ellipsoid_mats)): # assumes list
-                    if self.inv_ellipsoid_mats[i] is not None:
-                        tmp = np.array(self.inv_ellipsoid_mats[i])
-                        if self.shm_dict[key][i] is None:
-                            self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.inv_ellipsoid_mats[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
-                        self.inv_ellipsoid_mats[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
-                            shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
-                        del tmp
+                 
             if self.seg_assignments is not None:
                 key = 'seg_assignments'
                 for i in range(len(self.seg_assignments)): # assumes list
@@ -2934,7 +2548,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.seg_assignments[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.seg_assignments[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.pts_seg_starts is not None:
@@ -2946,7 +2560,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.pts_seg_starts[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.pts_seg_starts[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.argsort_solns is not None:
@@ -2958,7 +2572,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.argsort_solns[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.argsort_solns[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.soln_starts is not None:
@@ -2970,7 +2584,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.soln_starts[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.soln_starts[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) +  '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.collated_Xpts is not None:
@@ -2982,19 +2596,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.collated_Xpts[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.collated_Xpts[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
-                            shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
-                        del tmp
-            if self.ellipsoid_mats is not None:
-                key = 'ellipsoid_mats'
-                for i in range(len(self.ellipsoid_mats)): # assumes list
-                    if self.ellipsoid_mats[i] is not None:
-                        tmp = np.array(self.ellipsoid_mats[i])
-                        if self.shm_dict[key][i] is None:
-                            self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
-                        self.ellipsoid_mats[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
-                        self.ellipsoid_mats[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.nn_indices is not None:
@@ -3006,7 +2608,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.nn_indices[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.nn_indices[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.global_coll_indices is not None:
@@ -3018,7 +2620,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.global_coll_indices[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.global_coll_indices[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
             if self.local_coll_indices is not None:
@@ -3030,7 +2632,7 @@ class GSEobj:
                             self.shm_dict[key][i] = shared_memory.SharedMemory(create=True, size=tmp.nbytes)
                         self.local_coll_indices[i] = np.ndarray(tmp.shape, dtype=tmp.dtype, buffer=self.shm_dict[key][i].buf)
                         self.local_coll_indices[i][:] = tmp[:]
-                        with open(self.path + 'div' + str(i+1) + '//shared_mem_names.txt','a') as shm_name_file:
+                        with open(self.path + 'tess' + str(tess_indices[i]) + '//shared_mem_names.txt','a') as shm_name_file:
                             shm_name_file.write(key + ',' + self.shm_dict[key][i].name + ',' + str(np.prod(tmp.shape)) + '\n')
                         del tmp
         sysOps.throw_status('Done.')
@@ -3046,74 +2648,8 @@ class GSEobj:
                     
             if sysOps.check_file_exists("index_key.txt",self.path):
                 os.remove(self.path + "index_key.txt")
-                
-            # re-index
-            if not self.bipartite_data:
-                os.rename(self.path + 'link_assoc.txt',self.path + 'orig_link_assoc.txt')
-                sysOps.sh("awk -F, '{print $1 \",\" $3 \",\" $2 \",\" $4}' " + self.path + "orig_link_assoc.txt > " + self.path + "recol_orig_link_assoc.txt")
-                sysOps.sh("cat " + self.path + "orig_link_assoc.txt " + self.path + "recol_orig_link_assoc.txt > " + self.path + "link_assoc.txt")
-                
-                
-            sysOps.big_sort(" -k2,2 -t \",\" ","link_assoc.txt","link_assoc_sort_pts1.txt",self.path)
-            sysOps.sh("awk -F, 'BEGIN{prev_clust_index=-1;prev_GSEobj_index=-1;max_link_ind=-1;}"
-                      + "{if(prev_clust_index!=$2){prev_clust_index=$2;prev_GSEobj_index++;"
-                      + " print \"0,\" prev_clust_index \",\" prev_GSEobj_index > (\"" +  self.path + "index_key.txt\");}"
-                      + " print $1  \",\" prev_GSEobj_index  \",\" $3  \",\" $4 > (\"" +  self.path + "tmp_link_assoc_sort_pts1.txt\");if($1>max_linktype_ind)max_linktype_ind=$1;}"
-                      + "END{print prev_GSEobj_index+1 \",\" max_linktype_ind > (\"" +  self.path + "sort1_stats.txt\");}' "
-                      + self.path + "link_assoc_sort_pts1.txt")
-            os.remove(self.path + "link_assoc_sort_pts1.txt")
-            # index_key has columns:
-            # 1. pts type (0 or 1)
-            # 2. pts cluster index (sorted lexicographically)
-            # 3. pts GSEobj index (consecutive from 0)
-            
-            sort1_stats = sysOps.sh("tail -1 " + self.path + "sort1_stats.txt").strip('\n')
-            tot_pts1 = int(sort1_stats.split(',')[0])
-            max_linktype_ind = int(sort1_stats.split(',')[1])
-            
-            if self.bipartite_data:
-                init_linkcount_str = ''.join([("linkcount" + str(link_ind) + "=0;assoccount" + str(link_ind) + "=0;")
-                                             for link_ind in range(2,max_linktype_ind+1)])
-                update_linkcount_str = ''.join(["if($1==" + str(link_ind) +  "){linkcount" + str(link_ind) + "+=$4;assoccount" + str(link_ind) + "++;}"
-                                               for link_ind in range(2,max_linktype_ind+1)])
-                output_linkcount_str = ''.join(["print " + str(link_ind) + " \",\" linkcount" + str(link_ind)
-                                               + " \",\" assoccount" + str(link_ind) + " >> \"" + self.path + "link_assoc_stats.txt\";"
-                                                for link_ind in range(2,max_linktype_ind+1)])
-        
-                sysOps.big_sort(" -k3,3 -t \",\" ","tmp_link_assoc_sort_pts1.txt","link_assoc_sort_pts2.txt",self.path)
-                sysOps.sh("awk -F, 'BEGIN{" + init_linkcount_str + "prev_clust_index=-1;prev_GSEobj_index=" + str(tot_pts1-1) + ";}"
-                          + "{if(prev_clust_index!=$3){prev_clust_index=$3;prev_GSEobj_index++;"
-                          + " print \"1,\" prev_clust_index \",\" prev_GSEobj_index >> (\"" +  self.path + "index_key.txt\");}"
-                          + update_linkcount_str + "print($1  \",\" $2  \",\" prev_GSEobj_index  \",\" $4) > (\"" +  self.path + "link_assoc_reindexed.txt\");}"
-                          + "END{" + output_linkcount_str + " print prev_GSEobj_index+1 > (\"" +  self.path + "sort2_stats.txt\");}' "
-                          + self.path + "link_assoc_sort_pts2.txt")
-                            
-                os.remove(self.path + "link_assoc_sort_pts2.txt")
-                sort2_stats = sysOps.sh("tail -1 " + self.path + "sort2_stats.txt").strip('\n')
-            
-                tot_pts2 = int(sort2_stats)-tot_pts1
-            else:
-                index_key = np.loadtxt(self.path + "index_key.txt",dtype=np.int64,delimiter=',')
-                index_key_dict = dict()
-                for n in range(index_key.shape[0]):
-                    index_key_dict[index_key[n,1]] = index_key[n,2]
-                orig_link_assoc = np.loadtxt(self.path + 'orig_link_assoc.txt',dtype=np.float64,delimiter=',')
-                for i in range(orig_link_assoc.shape[0]):
-                    orig_link_assoc[i,1] = index_key_dict[int(orig_link_assoc[i,1])]
-                    orig_link_assoc[i,2] = index_key_dict[int(orig_link_assoc[i,2])]
-                np.savetxt(self.path + "link_assoc_reindexed.txt",orig_link_assoc,fmt='%i,%i,%i,%.10e',delimiter = ',')
-            
-            with open(self.path + "link_assoc_stats.txt",'a') as statsfile:
-                statsfile.write('0,' + str(tot_pts1) + '\n')
-                if self.bipartite_data:
-                    statsfile.write('1,' + str(tot_pts2))
-            self.Npt_tp1 = int(tot_pts1)
-            if self.bipartite_data:
-                self.Npt_tp2 = int(tot_pts2)
-            else:
-                os.remove(self.path + "link_assoc.txt")
-                os.rename(self.path + 'orig_link_assoc.txt',self.path + 'link_assoc.txt')
-                self.Npt_tp2 = 0
+              
+            self.Npt_tp1, self.Npt_tp2 = reindex_input_files(self.bipartite_data,self.path)
         else:
             self.Npt_tp1 = 0
             self.Npt_tp2 = 0
@@ -3131,15 +2667,21 @@ class GSEobj:
             self.shm_dict = dict()
             with open(self.path + "shared_mem_names.txt", 'r') as shm_name_file:
                 for line in shm_name_file:
-                    key,shm_name,arr_size = line.strip('\n').split(',')
-                    arr_size = int(arr_size)
-                    self.shm_dict[key] = shared_memory.SharedMemory(name=shm_name)
+                    if line.strip('\n').split(',')[0] == 'nn_mat': # mult-component
+                        key,shm_name_data,arr_size_data,shm_name_indices,arr_size_indices,shm_name_indptr,arr_size_indptr = line.strip('\n').split(',')
+                        arr_size_data, arr_size_indices, arr_size_indptr = int(arr_size_data), int(arr_size_indices), int(arr_size_indptr)
+                        self.shm_dict[key] = dict()
+                        self.shm_dict[key]['data'] = shared_memory.SharedMemory(name=shm_name_data)
+                        self.shm_dict[key]['indices'] = shared_memory.SharedMemory(name=shm_name_indices)
+                        self.shm_dict[key]['indptr'] = shared_memory.SharedMemory(name=shm_name_indptr)
+                    else:
+                        key,shm_name,arr_size = line.strip('\n').split(',')
+                        arr_size = int(arr_size)
+                        self.shm_dict[key] = shared_memory.SharedMemory(name=shm_name)
                     if key == 'index_key':
                         self.index_key = np.ndarray((int(arr_size),), dtype=np.int64, buffer=self.shm_dict[key].buf)
                     elif key == 'link_data':
                         self.link_data = np.ndarray((int(arr_size/3.0),3), dtype=np.float64, buffer=self.shm_dict[key].buf)
-                    elif key == 'quantile_assoc_weights':
-                        self.quantile_assoc_weights = np.ndarray((int(arr_size/2.0),2), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'pseudolink_data':
                         self.pseudolink_data = np.ndarray((int(arr_size/3.0),3), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'seq_evecs':
@@ -3148,12 +2690,17 @@ class GSEobj:
                         self.sum_pt_tp1_link = np.ndarray((int(arr_size),), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'sum_pt_tp2_link':
                         self.sum_pt_tp2_link = np.ndarray((int(arr_size),), dtype=np.float64, buffer=self.shm_dict[key].buf)
-                    elif key == 'manifold_vecs':
-                        self.manifold_vecs = np.ndarray((self.Npts,self.spat_dims,int(arr_size/(self.spat_dims*self.Npts))), dtype=np.float64, buffer=self.shm_dict[key].buf)
-                    elif key == 'manifold_coldims':
-                        self.manifold_coldims = np.ndarray((self.Npts,int(arr_size/self.Npts)), dtype=np.int64, buffer=self.shm_dict[key].buf)
-                    elif key == 'inv_ellipsoid_mats':
-                        self.inv_ellipsoid_mats = np.ndarray((self.Npts,self.spat_dims,self.spat_dims), dtype=np.float64, buffer=self.shm_dict[key].buf)
+                    elif key == 'shortest_paths_dists':
+                        self.shortest_paths_dists = np.ndarray((self.Npts,int(arr_size/self.Npts)), dtype=np.float64, buffer=self.shm_dict[key].buf)
+                    elif key == 'nn_mat':
+                        self.nn_mat = csr_matrix((self.Npts,self.Npts),dtype=np.float64)
+                        self.nn_mat.data = np.ndarray((int(arr_size_data),), dtype=np.float64, buffer=self.shm_dict[key]['data'].buf)
+                        required_size = int(arr_size_indices) * 4 # 4 bytes for np.int32
+                        if self.shm_dict[key]['indices'].size < required_size:
+                            raise ValueError(f"Shared memory buffer for 'indices' must be at least {required_size} bytes vs " + str(self.shm_dict[key]['indices'].size))
+
+                        self.nn_mat.indices = np.ndarray((int(arr_size_indices),), dtype=np.int32, buffer=self.shm_dict[key]['indices'].buf)
+                        self.nn_mat.indptr = np.ndarray((int(arr_size_indptr),), dtype=np.int32, buffer=self.shm_dict[key]['indptr'].buf)
                     elif key == 'seg_assignments':
                         self.seg_assignments = np.ndarray((int(arr_size/2.0),2), dtype=np.int64, buffer=self.shm_dict[key].buf)
                     
@@ -3166,8 +2713,6 @@ class GSEobj:
                     elif key == 'pts_seg_starts':
                         self.pts_seg_starts = np.ndarray((int(arr_size),), dtype=np.int64, buffer=self.shm_dict[key].buf)
                     
-                    elif key == 'ellipsoid_mats':
-                        self.ellipsoid_mats = np.ndarray((self.Npts,self.spat_dims,self.spat_dims), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'nn_indices':
                         self.nn_indices = np.ndarray((self.Npts,int(arr_size/self.Npts)), dtype=np.int64, buffer=self.shm_dict[key].buf)
                     elif key == 'global_coll_indices':
@@ -3191,8 +2736,6 @@ class GSEobj:
                         self.task_inputs_and_outputs = np.ndarray((int(arr_size/6),6), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'Xpts':
                         self.Xpts = np.ndarray((self.Npts,self.spat_dims), dtype=np.float64, buffer=self.shm_dict[key].buf)
-                    elif key == 'assoc_lengthscale':
-                        self.assoc_lengthscale = np.ndarray((2,), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     elif key == 'dXpts':
                         self.dXpts = np.ndarray((self.Npts,self.spat_dims,2), dtype=np.float64, buffer=self.shm_dict[key].buf)
                     
@@ -3202,6 +2745,10 @@ class GSEobj:
             
             self.index_key = np.loadtxt(self.path + "index_key.txt",dtype=np.int64,delimiter=',')[:,1]
             self.link_data = np.loadtxt(self.path + "link_assoc_reindexed.txt",delimiter=',',dtype=np.float64)[:,1:]
+            
+            ## READ-WEIGHT
+            if self.link_data.shape[1] > 3:
+                self.link_data = self.link_data[:,:3]
             
             tmp_sorted_indices = np.concatenate([self.link_data[:,0], self.link_data[:,1]])
             # GSEobj.sorted_link_data_inds will consist of indices that order the non-stored vector np.concatenate([link_data[:,0], link_data[:,1]]) for the first
@@ -3238,10 +2785,12 @@ class GSEobj:
         
         if self.print_status:
             sysOps.throw_status('Data read-in complete. Found ' + str(np.sum(~valid_pt_tp1_indices)) + ' empty type-1 indices and ' + str(np.sum(~valid_pt_tp2_indices)) + ' empty type-2 indices among ' + str(valid_pt_tp1_indices.shape[0]) + ' points.')
+        
         return
-        
-    def make_subdirs(self,seg_filename,min_seg_size=1000,reassign_orphans=True):
-        
+     
+     
+    def make_subdirs(self,seg_filename,min_seg_size=1000,reassign_orphans=True,preorthbasis_path=None,rms_path=None):
+        sysOps.throw_status('Making sub-directories')
         if not sysOps.check_file_exists('reindexed_' + seg_filename,self.path):
             add_links = True
             seg_assignments = np.loadtxt(self.path + seg_filename,delimiter=',',dtype=np.int64)
@@ -3252,41 +2801,30 @@ class GSEobj:
         #add_pseudolinks = (self.pseudolink_data is not None)
         
         # replace with gap-normalized data
-        self.seq_evecs = np.load(sysOps.globaldatapath + "orig_evecs_gapnorm.npy").T
         # check that file matches current object
         if self.Npts != seg_assignments.shape[0] or np.sum(self.index_key==seg_assignments[:,0]) != self.Npts:
             sysOps.throw_status('Error in GSEobj.make_subdirs(): object/file mismatch.')
             sysOps.exitProgram()
             
         if add_links:
+            
             max_segment_index = np.max(seg_assignments[:,1])
-            segment_bins = np.zeros(max_segment_index+1,dtype=np.int64)
-            seg_assignments_buff = -np.ones(self.Npts,dtype=np.int64)
-            orig_seg_assignments = np.array(seg_assignments)
-            while True:
-                segment_bins[:] = 0
-                seg_assignments[:] = orig_seg_assignments[:]
-                for n in range(self.Npts):
-                    segment_bins[seg_assignments[n,1]] += 1
-                sysOps.throw_status('Found ' + str(np.sum(segment_bins[seg_assignments[:,1]] < min_seg_size)) + ' orphan points with minimum segment size = ' + str(min_seg_size))
-                seg_assignments_buff[:] = -1
-                assign_orphans(seg_assignments[:,1],seg_assignments_buff,self.seq_evecs.T,self.link_data,self.sorted_link_data_inds,self.sorted_link_data_ind_starts,segment_bins,min_seg_size,self.Npts,self.Nassoc)
-                if np.sum(segment_bins>=min_seg_size) > min_seg_size:
-                    break
-                else:
-                    prev_seg_assignments = np.array(seg_assignments)
-                    prev_segment_bins = np.array(segment_bins)
-                    if int(min_seg_size/2.0) < 2*(self.inference_eignum+1):
-                        break
-                    else:
-                        min_seg_size = int(min_seg_size/2.0)
+            segment_bins = np.histogram(seg_assignments[:,1],bins=np.arange(np.max(seg_assignments[:,1])+2))[0]
+            seg_assignments[segment_bins[seg_assignments[:,1]] < min_seg_size,1] = -1
+            ctr_coords = np.zeros([self.seq_evecs.shape[0],max_segment_index+1],dtype=np.float64)
+            sysOps.throw_status('Calculating centers ...')
+            for n in np.where(seg_assignments[:,1]>=0)[0]:
+                ctr_coords[:,seg_assignments[n,1]] += self.seq_evecs[:,n]/segment_bins[seg_assignments[n,1]]
+                
+            sysOps.throw_status('Found ' + str(np.sum(segment_bins[seg_assignments[:,1]] < min_seg_size)) + ' orphan points with minimum segment size = ' + str(min_seg_size))
+            
+            randbuff = np.zeros(self.Npts,dtype=np.int64)
+            segment_bins[segment_bins < min_seg_size] = 0
+            ctr_indices = np.where(segment_bins >= min_seg_size)[0]
+            assign_orphans(seg_assignments[:,1],ctr_coords,self.seq_evecs,segment_bins,randbuff,ctr_indices,max_segment_index+1,self.Npts)
                         
-            if prev_seg_assignments is not None:
-                seg_assignments = np.array(prev_seg_assignments)
-                segment_bins = np.array(prev_segment_bins)
-                del prev_seg_assignments, prev_segment_bins
             sysOps.throw_status('Completed assignments.')
-            reindexed_seg_lookup = np.zeros(max_segment_index+1,dtype=np.int64)
+            reindexed_seg_lookup = -np.ones(max_segment_index+1,dtype=np.int64)
             new_max_segment_index = np.sum(segment_bins>=min_seg_size)-1
             reindexed_seg_lookup[np.argsort(-segment_bins)] = np.concatenate([np.random.permutation(new_max_segment_index+1),-np.ones(max_segment_index-new_max_segment_index)])
             # replace indices
@@ -3296,8 +2834,12 @@ class GSEobj:
             max_segment_index = int(new_max_segment_index)
             sysOps.throw_status('Re-assigned max_segment_index --> ' + str(max_segment_index))
             del reindexed_seg_lookup
+            
         else:
             max_segment_index = np.max(seg_assignments[:,1])
+            
+        with open(self.path + 'max_segment_index.txt','w') as outfile:
+            outfile.write(str(max_segment_index))
                         
         argsort_seg = np.argsort(seg_assignments[:,1])
         sorted_seg_starts = np.append(np.append(0,1+np.where(np.diff(seg_assignments[argsort_seg,1])>0)[0]),seg_assignments.shape[0])
@@ -3331,7 +2873,10 @@ class GSEobj:
         sysOps.throw_status('Completed outer associations for ' + self.path + ' ...')
         segment_link_assoc_arrays = segment_link_assoc_arrays[segment_link_assoc_arrays[:,0]!=segment_link_assoc_arrays[:,1],:]
         segment_link_assoc_arrays = segment_link_assoc_arrays[segment_link_assoc_arrays[:,2]>0,:] # remove empty entries
-                                
+        
+        preorthbasis = None
+        rms_dists = None
+        
         link_assoc_buff = -np.ones([np.max(segment_assocs),3],dtype=np.float64)
         
         for seg_ind in np.argsort(-np.sum(segment_bins,axis=1)): # follow descending order of size
@@ -3353,42 +2898,60 @@ class GSEobj:
                 os.mkdir(self.path + 'seg' + str(seg_ind))
                 os.mkdir(self.path + 'seg' + str(seg_ind) + '//tmp')
                 np.savetxt(self.path + 'seg' + str(seg_ind) + '//link_assoc.txt', np.concatenate([2*np.ones((inner_assoc.shape[0],1)),inner_assoc],axis=1),fmt='%i,%i,%i,%.10e',delimiter=',')
-            
-            
+                
+                    
         if add_links:
             seg_assignments[seg_assignments[:,1]>max_segment_index,1] = -1
             np.savetxt(self.path + 'reindexed_' + seg_filename,seg_assignments,delimiter=',',fmt='%i')
         
         sysOps.throw_status('Exiting make_subdirs()')
         return max_segment_index
+        
       
     def knn(self, soln_ind, nn):
         # note: assumes seq_evecs is gap-normalized
         sysOps.throw_status('Performing high-dim approximate kNN using collated_Xpts matrix.')
         collated_dim = self.collated_Xpts.shape[1]-2
-        all_soln_inds = self.argsort_solns[self.soln_starts[soln_ind]:self.soln_starts[soln_ind+1]]
-        subspace = np.concatenate([self.collated_Xpts[all_soln_inds,2:],
-                                   np.zeros([all_soln_inds.shape[0],collated_dim])],axis=1)
-        soln_pts_bool_array = np.zeros(all_soln_inds.shape[0],dtype=np.bool_)
+        if soln_ind >= 0:
+            all_soln_inds = self.argsort_solns[self.soln_starts[soln_ind]:self.soln_starts[soln_ind+1]]
+            subspace = np.concatenate([self.collated_Xpts[all_soln_inds,2:],
+                                       np.zeros([all_soln_inds.shape[0],collated_dim])],axis=1)
+            soln_pts_bool_array = np.zeros(all_soln_inds.shape[0],dtype=np.bool_)
+            
+            this_soln_Nptstot = (self.soln_starts[soln_ind+1] - self.soln_starts[soln_ind])
+            inclusion_indices = -np.ones(all_soln_inds.shape[0],dtype=np.int64)
+            # inclusion_indices: indices = location in subspace, values = original point indices
+                
+            on_index = 0
+            for i in range(all_soln_inds.shape[0]):
+                if int(self.collated_Xpts[all_soln_inds[i],1]) > self.max_segment_index :
+                    subspace[on_index,collated_dim:] = self.seq_evecs[:,int(self.collated_Xpts[all_soln_inds[i],1])-(self.max_segment_index+1)]
+                    inclusion_indices[on_index] = self.collated_Xpts[all_soln_inds[i],1]
+                    on_index += 1
+            inclusion_indices = inclusion_indices[:on_index]
+            subspace = subspace[:on_index,:]
+            
+            # inclusion_indices --> self.collated_Xpts
+        else:
+            inclusion_indices = np.arange(self.Npts,dtype=np.int64)
+            subspace = self.seq_evecs.T
         
-        this_soln_Nptstot = (self.soln_starts[soln_ind+1] - self.soln_starts[soln_ind])
-        inclusion_indices = -np.ones(all_soln_inds.shape[0],dtype=np.int64)
-        # inclusion_indices: indices = location in subspace, values = original point indices
+        if subspace.shape[0] >= 10000: # fast search with Faiss
+            # Initialize Faiss index
+            index = faiss.IndexFlatL2(subspace.shape[1])
+            # Add data points to the index
+            index.add(subspace)
+            # Perform kNN search
+            nn_distances, nn_indices = index.search(subspace, nn+1)
+        else:
+            nbrs = NearestNeighbors(n_neighbors=nn+1).fit(subspace)
+            nn_distances, nn_indices = nbrs.kneighbors(subspace)
+            del nbrs
         
-        on_index = 0
-        for i in range(all_soln_inds.shape[0]):
-            if int(self.collated_Xpts[all_soln_inds[i],1]) > self.max_segment_index :
-                subspace[on_index,collated_dim:] = self.seq_evecs[:,int(self.collated_Xpts[all_soln_inds[i],1])-(self.max_segment_index+1)]
-                inclusion_indices[on_index] = self.collated_Xpts[all_soln_inds[i],1]
-                on_index += 1
-        inclusion_indices = inclusion_indices[:on_index]
-        subspace = subspace[:on_index,:]
-        
-        # inclusion_indices --> self.collated_Xpts
-        nbrs = NearestNeighbors(n_neighbors=nn+1).fit(subspace)
-        nn_distances, nn_indices = nbrs.kneighbors(subspace)
-        del nn_distances, nbrs, subspace, all_soln_inds
+        if soln_ind >= 0:
+            del subspace, all_soln_inds
         nn_indices = inclusion_indices[nn_indices]
+        # nn_distances will retain same ordering
         
         for n in range(nn_indices.shape[0]):
             if nn_indices[n,0] != inclusion_indices[n]: # can happen due to floating point error
@@ -3401,11 +2964,13 @@ class GSEobj:
                     nn_indices[n,nn] = nn_indices[n,0] # replace most distant index with the index currently occupying the 0 position
                     nn_indices[n,0] = inclusion_indices[n]
         nn_indices -= (self.max_segment_index+1)
-        np.savetxt(self.path + 'nn_indices' + str(soln_ind) + '.txt', nn_indices[np.argsort(nn_indices[:,0]),:],delimiter=',',fmt='%i')
         
-        del nn_indices
+        ordering = np.argsort(nn_indices[:,0])
+        np.savetxt(self.path + 'nn_indices' + str(soln_ind) + '.txt', np.concatenate([nn_indices[ordering,:],nn_distances[ordering,:]],axis=1),delimiter=',',fmt= ",".join(['%i']*(nn+1)) + ',' + ",".join(['%.10e']*(nn+1)))
+        
+        del nn_indices, nn_distances
             
-    def eigen_decomp(self,orth=False,projmatfile_indices=None,print_evecs=True,apply_dot2=None):
+    def eigen_decomp(self,orth=False,projmatfile_indices=None,print_evecs=True,apply_dot2=None, krylov_approx = False, rayleigh_approx = False):
     # Assemble linear manifold from data using "local linearity" assumption
     # assumes link_data type-1- and type-2-indices at this point has non-overlapping indices
         sysOps.throw_status('Forming row-normalized linear operator before eigen-decomposition ...')
@@ -3429,39 +2994,95 @@ class GSEobj:
             
             get_normalized_sparse_matrix(sum_pt_tp1_link, sum_pt_tp2_link,row_indices,col_indices,
                                          norm_link_data,self.link_data,self.Nassoc,self.Npts,False,np.ones(self.Nassoc,dtype=np.float64))
-            self.seq_evals, self.seq_evecs = gl_eig_decomp(norm_link_data, row_indices, col_indices, self.inference_eignum, self.Npts, self.spat_dims, False)
+            
+            csc_op1 = csr_matrix((norm_link_data, (row_indices, col_indices)), (self.Npts, self.Npts))
+                        
+            if type(krylov_approx) == str:
+                sysOps.throw_status('Performing Krylov space approximation, inference_eignum = ' + str(self.inference_eignum))
+                krylov_space = scipy.linalg.qr(np.load(self.path + krylov_approx), mode='economic')[0] # generate orthonormal basis
+                num_basis_vecs = krylov_space.shape[1]
+                krylov_space = [[krylov_space[:,i].reshape([self.Npts,1])] for i in range(num_basis_vecs)]
+                for i in range(num_basis_vecs):
+                    for j in range(2*int(np.ceil(max(100,self.inference_eignum)/num_basis_vecs))):
+                        krylov_space[i].append(csc_op1.dot(krylov_space[i][j]))
+                    krylov_space[i] = np.concatenate(krylov_space[i],axis=1)
+                krylov_space = np.concatenate(krylov_space,axis=1)
+                krylov_space, r = scipy.linalg.qr(krylov_space, mode='economic')
+                innerprod = krylov_space.T.dot(csc_op1.dot(krylov_space))
+                evals,evecs = LA.eig(innerprod)
+                eval_order = np.argsort(np.abs(np.real(evals)))[:(1+self.inference_eignum)]
+                evecs = np.real(evecs[:,eval_order])
+                evals = np.real(evals[eval_order])
+                self.seq_evecs = krylov_space.dot(evecs)
+                
+                triv_eig_index = np.argmin(np.var(self.seq_evecs[:,:10],axis = 0))
+                sysOps.throw_status('Trivial index ' + str(triv_eig_index) + ' removed.')
+                top_nontriv_indices = np.where(np.arange(self.seq_evecs.shape[1]) != triv_eig_index)[0]
+                # remove trivial (translational) eigenvector
+                self.seq_evecs = self.seq_evecs[:,top_nontriv_indices]
+                self.seq_evals = evals[top_nontriv_indices]
+                
+                sysOps.throw_status('Done.')
+                        
+            else:
+                self.seq_evals, self.seq_evecs = gl_eig_decomp(None,None,None, self.inference_eignum, self.Npts, self.spat_dims, False,linop = csc_op1)
+           
             if not orth and print_evecs: # otherwise, will be printed below, making this command redundant
                 np.savetxt(self.path + "evals.txt",self.seq_evals,fmt='%.10e',delimiter=',')
                 np.save(self.path + "evecs.npy",self.seq_evecs)
         else:
             row_indices = np.int64(np.concatenate([self.link_data[:,0], self.link_data[:,1]]))
             col_indices = np.int64(np.concatenate([self.link_data[:,1], self.link_data[:,0]]))
-                            
+                          
             diag_mat = csc_matrix((np.power(np.add(sum_pt_tp1_link,sum_pt_tp2_link),-1), (np.arange(self.Npts,dtype=np.int64), np.arange(self.Npts,dtype=np.int64))), (self.Npts, self.Npts))
             norm_link_data = np.concatenate([self.link_data[:,2],self.link_data[:,2]])
             csc_op1 = csc_matrix((norm_link_data, (row_indices, col_indices)), (self.Npts, self.Npts))
             csc_op1 = diag_mat.dot(csc_op1) #row-normalize
             del diag_mat
-            
-            pseudolink_op3 = None
-            if sysOps.check_file_exists('embed_pseudolinks.npz',self.path):
-                pseudolink_op3 = load_npz(self.path + 'embed_pseudolinks.npz') # should already be row-normalized
-                sysOps.throw_status("Constructed pseudolink_op3")
                 
-            pseudolink_op2 = list()
+            pseudolink_op2 = 0
             for projmat in projmatfile_indices:
-                tmp_mat = load_npz(self.path + 'pseudolink_assoc_' + str(projmat) + '_reindexed.npz') # should already be row-normalized
-                tmp_mat.sum_duplicates()
-                pseudolink_op2.append(csc_matrix(tmp_mat))
+                pseudolink_op2 = pseudolink_op2 + load_npz(self.path + 'pseudolink_assoc_' + str(projmat) + '_reindexed.npz').tocsc() # should already be row-normalized
                 
-                del tmp_mat
+            my_dot2 = dot2(csc_op1,[pseudolink_op2])
                 
-            my_dot2 = dot2(csc_op1,pseudolink_op2,pseudolink_op3)
-            self.seq_evals, evecs_large = gl_eig_decomp(None,None,None, self.inference_eignum, self.Npts, self.spat_dims, False,linop=LinearOperator((self.Npts,self.Npts), matvec=my_dot2.makedot))
+            if  type(krylov_approx) == str:
+                sysOps.throw_status('Performing Krylov space approximation, inference_eignum = ' + str(self.inference_eignum))
+                krylov_space = scipy.linalg.qr(np.load(self.path + krylov_approx), mode='economic')[0] # generate orthonormal basis
+                num_basis_vecs = krylov_space.shape[1]
+                krylov_space = [[krylov_space[:,i].reshape([self.Npts,1])] for i in range(num_basis_vecs)]
+                for i in range(num_basis_vecs):
+                    for j in range(2*int(np.ceil(max(100,self.inference_eignum)/num_basis_vecs))):
+                        krylov_space[i].append(my_dot2.makedot(krylov_space[i][j]))
+                    krylov_space[i] = np.concatenate(krylov_space[i],axis=1)
+                krylov_space = np.concatenate(krylov_space,axis=1)
+                krylov_space = scipy.linalg.qr(krylov_space, mode='economic')[0]
+                innerprod = krylov_space.T.dot(my_dot2.makedot(krylov_space))
+                evals,evecs = LA.eig(innerprod)
+                eval_order = np.argsort(np.abs(np.real(evals)))[:(1+self.inference_eignum)]
+                evecs = np.real(evecs[:,eval_order])
+                evals = np.real(evals[eval_order])
+                evecs_large = krylov_space.dot(evecs)
+                                
+                triv_eig_index = np.argmin(np.var(evecs_large[:,:10],axis = 0))
+                sysOps.throw_status('Trivial index ' + str(triv_eig_index) + ' removed.')
+                top_nontriv_indices = np.where(np.arange(evecs_large.shape[1]) != triv_eig_index)[0]
+                # remove trivial (translational) eigenvector
+                evecs_large = evecs_large[:,top_nontriv_indices]
+                self.seq_evals = evals[top_nontriv_indices]
+                
+            else:
+                self.seq_evals, evecs_large = gl_eig_decomp(None,None,None, self.inference_eignum, self.Npts, self.spat_dims, False,linop=LinearOperator((self.Npts,self.Npts), matvec=my_dot2.makedot))
+                
             # write to disk
+            del pseudolink_op2, csc_op1, my_dot2
             np.save(self.path + "evecs.npy",evecs_large)
             np.savetxt(self.path + "evals.txt",self.seq_evals,fmt='%.10e',delimiter=',')
-            del evecs_large, csc_op1
+            del evecs_large
+            try:
+                sysOps.sh("rm -r " + self.path + 'krylov_*')
+            except:
+                pass
             self.seq_evecs = np.load(self.path + "evecs.npy")
         del norm_link_data, row_indices, col_indices
             
@@ -3477,177 +3098,118 @@ class GSEobj:
         self.seq_evecs = self.seq_evecs.T
         return
     
-    def calc_manifolds(self, start_ind, end_ind):
+    def select_nn(self, start_ind, end_ind):
         if end_ind > self.Npts or start_ind < 0 or start_ind >= end_ind:
-            sysOps.throw_status('Input error in calc_manifolds()')
+            sysOps.throw_status('Input error in select_nn()')
             sysOps.exitProgram()
         
         my_Npts = end_ind-start_ind
         index_partition_size = 10000
-        collated_dim = self.inference_eignum
-        sparsity = int(collated_dim)
-        soln_dims = int(collated_dim)
-        nn_indices = -np.ones([my_Npts,(2*collated_dim)+1],dtype=np.int64)
+        nn_num = 2*self.inference_eignum
+        nn_indices = -np.ones([my_Npts,nn_num+1],dtype=np.int64)
         nn_indices[:,0] = np.arange(start_ind, end_ind)
+        nn_distances = -np.ones([my_Npts,nn_num+1],dtype=np.float64)
+        nn_distances[:,0] = 0
+        randchoice_buff = -np.ones(nn_num,dtype=np.int64)
+                            
+        num_tessdirs = len(sorted([int(dirname[len(sysOps.globaldatapath + 'tess'):]) for dirname in sysOps.sh("ls -d " + sysOps.globaldatapath + 'tess*').strip('\n').split("\n")]))
         
         start_partition_index = int(np.floor(start_ind/index_partition_size))
         end_partition_index = int(np.ceil(end_ind/index_partition_size))
         my_pt_index = 0
         for partition_index in range(start_partition_index,end_partition_index):
-            nn_partition = np.loadtxt(sysOps.globaldatapath + 'nn_indices_' + str(partition_index) + '.txt',delimiter=',',dtype=np.int64)[:,1:]
+            nn_partition = np.loadtxt(sysOps.globaldatapath + 'nn_indices_' + str(partition_index) + '.txt',delimiter=',',dtype=np.int64)
+            nn_partition_distances = np.loadtxt(sysOps.globaldatapath + 'nn_distances_' + str(partition_index) + '.txt',delimiter=',',dtype=np.float64)
+            nn_partition_overlap = np.loadtxt(sysOps.globaldatapath + 'nn_overlap_' + str(partition_index) + '.txt',delimiter=',',dtype=np.bool_)
             this_partition_start_ind = max(start_ind,partition_index*index_partition_size)
             this_partition_end_ind = min((partition_index+1)*index_partition_size,end_ind)
+            sum_overlap = np.zeros(nn_partition.shape[1],dtype=np.float64)
+            mean_dists = np.zeros(nn_partition.shape[1],dtype=np.float64)
+            row_size = nn_partition.shape[1]
             for n in range(this_partition_start_ind,this_partition_end_ind):
-                nn_indices[my_pt_index,1:] = np.random.choice(np.unique(nn_partition[n - (partition_index*index_partition_size),:]),2*collated_dim,replace=False)
-                my_pt_index += 1
-            del nn_partition
-        np.savetxt(self.path+ "nn_indices~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nn_indices,delimiter=',',fmt='%i')
+                unique_vals,unique_idxs,unique_inverse,unique_counts = np.unique(nn_partition[n - (partition_index*index_partition_size),:],return_index=True,return_inverse=True,return_counts=True)
+                num_unique = np.max(unique_inverse)+1
+                sum_overlap[:num_unique] = 0.0
+                mean_dists[:num_unique] = 0.0
+                for i in range(row_size):
+                    sum_overlap[unique_inverse[i]] += float(nn_partition_overlap[n - (partition_index*index_partition_size),i])/unique_counts[unique_inverse[i]]
+                    mean_dists[unique_inverse[i]] += nn_partition_distances[n - (partition_index*index_partition_size),i]/unique_counts[unique_inverse[i]]
             
-        buffsize = max(soln_dims,nn_indices.shape[1]*self.spat_dims)
-        outerprodbuff = np.zeros([max(collated_dim,self.spat_dims*nn_indices.shape[1]),soln_dims],dtype=np.float64)
-        manifold_vecs = np.zeros([my_Npts,self.spat_dims,soln_dims],dtype=np.float64)
-        manifold_coldims = -np.ones([my_Npts,soln_dims],dtype=np.int64)
-        Sbuff = np.zeros(collated_dim,dtype=np.float64)
-        Vhbuff = np.array(outerprodbuff)
-        tmp_sumsq_buff = np.zeros(collated_dim*(self.max_segment_index+2),dtype=np.float64)
-        diffbuff = np.zeros(collated_dim*(self.max_segment_index+2),dtype=np.float64)
-        tmp_coldim_lookup_buff = -np.ones(collated_dim*(self.max_segment_index+2),dtype=np.int64)
-        tmp_seg_lookup = -np.ones(self.max_segment_index+2,dtype=np.int64)
-        use_dims = np.zeros(collated_dim*(self.max_segment_index+2),dtype=np.bool_)
-        dim_buff = np.zeros(collated_dim*(self.max_segment_index+2),dtype=np.int64)
+                sum_overlap[:num_unique][sum_overlap[:num_unique] > 0] = 1
+                if np.sum(sum_overlap[:num_unique]) > self.spat_dims:
+                    mean_dists[:num_unique][sum_overlap[:num_unique] == 0] = np.inf
+                    randchoice_buff[:] = np.argsort(-sum_overlap[:num_unique] + np.random.uniform(low=-0.5, high=0.5, size=num_unique))[:nn_num]
+                else:
+                    accepted_val = np.partition(mean_dists[:num_unique], self.spat_dims)[self.spat_dims]
+                    mean_dists[:num_unique][mean_dists[:num_unique] > accepted_val] = np.inf
+                    randchoice_buff[:] = np.argsort(mean_dists[:num_unique])[:nn_num]
+                
+                nn_indices[my_pt_index,1:] = unique_vals[randchoice_buff[:]]
+                nn_distances[my_pt_index,1:] = mean_dists[randchoice_buff[:]]
+                
+                if np.sum(mean_dists[randchoice_buff[:]] != np.inf) == 0:
+                    sysOps.throw_status('ERROR: no non-infs in n = ' + str(n))
+                    sysOps.throw_status(str(nn_partition[n - (partition_index*index_partition_size),:]))
+                    sysOps.throw_status(str(nn_partition_overlap[n - (partition_index*index_partition_size),:]))
+                    sysOps.throw_status(str(nn_partition_distances[n - (partition_index*index_partition_size),:]))
+                    sysOps.throw_status(str(unique_vals))
+                    sysOps.throw_status(str(unique_idxs))
+                    sysOps.throw_status(str(unique_inverse))
+                    sysOps.throw_status(str(unique_counts))
+                    sysOps.throw_status(str(randchoice_buff))
+                    sysOps.throw_status(str(sum_overlap[:num_unique]))
+                    sysOps.exitProgram()
+                
+                my_pt_index += 1
+                
+            del nn_partition, nn_partition_distances
+        np.savetxt(self.path+ "nbr_indices_0~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nn_indices[:,1:],delimiter=',',fmt='%i')
+        np.savetxt(self.path+ "nbr_distances_0~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nn_distances[:,1:],delimiter=',',fmt='%.10e')
+            
+    def shortest_path(self, start_ind, end_ind):
         
-        sysOps.throw_status('Estimating local manifolds, [start_ind,end_ind] = ' + str([start_ind,end_ind]))
-        get_local_manifold(manifold_vecs,manifold_coldims,
-                           tmp_sumsq_buff,tmp_coldim_lookup_buff,tmp_seg_lookup,dim_buff,use_dims,
-                           outerprodbuff, nn_indices,
-                           self.seg_assignments[:,1], self.pts_seg_starts, self.collated_Xpts,
-                           self.global_coll_indices,self.local_coll_indices,
-                           Sbuff,Vhbuff,diffbuff,self.spat_dims,nn_indices.shape[1]-1,self.max_segment_index,collated_dim,sparsity,start_ind,end_ind)
-        sysOps.throw_status('Sorting retained dimensions ...')
-        for n in range(my_Npts):
-            dim_buff[:soln_dims] = np.argsort(manifold_coldims[n,:])
-            manifold_coldims[n,:] = manifold_coldims[n,dim_buff[:soln_dims]]
-            for d in range(self.spat_dims):
-                manifold_vecs[n,d,:] = manifold_vecs[n,d,dim_buff[:soln_dims]]
-                                                                
-        np.savetxt(self.path+ "manifold_vecs~" + str(start_ind) + "~" + str(end_ind) + "~.txt",manifold_vecs.reshape([my_Npts,manifold_vecs.shape[1]*manifold_vecs.shape[2]]),delimiter=',',fmt='%.10e')
-        np.savetxt(self.path+ "manifold_coldims~" + str(start_ind) + "~" + str(end_ind) + "~.txt",manifold_coldims,delimiter=',',fmt='%i')
+        # load pre-assigned sources
+        choice_indices = np.load(self.path + 'landmarks_' + str(int(np.round(start_ind/(end_ind-start_ind)))) + '.npy')
+        sysOps.throw_status('Calculating shortest paths from ' + str(choice_indices.shape[0]) + ' sources.')
+                    
+        dist_file_prefix = "shortest_paths_dists"
+            
+        dist_matrix = scipy.sparse.csgraph.dijkstra(csgraph=self.nn_mat, directed=False, min_only=False, indices=choice_indices, return_predecessors=False)
+        sysOps.throw_status('Completed call to Dijkstra algorithm for indices ' + str([start_ind,end_ind]))
+                
+        # output for all points collectively
+        np.savetxt(self.path + dist_file_prefix+ "~" + str(start_ind) + "~" + str(end_ind) + "~.txt",dist_matrix,delimiter=',',fmt='%.10e')
     
-    def calc_ellipsoids(self,start_ind,end_ind):
-        sysOps.throw_status('Calculating ellipsoids ...')
-        collated_dim = self.inference_eignum
+    def final_quantile_computation(self, start_ind, end_ind):
+    
+        src_indices = np.load(self.path + 'landmarks.npy')
         
-        tmp_coldim_lookup_buff = -np.ones(collated_dim*(self.max_segment_index+2),dtype=np.int64)
+        kneighbors =  2*self.inference_eignum
+        nbr_indices = -np.ones([end_ind-start_ind,kneighbors],dtype=np.int64)
+        nbr_distances = -np.ones([end_ind-start_ind,kneighbors],dtype=np.float64)
+        max_nbr_indices = -np.ones([end_ind-start_ind,kneighbors],dtype=np.int64)
+        max_nbr_distances = -np.ones([end_ind-start_ind,kneighbors],dtype=np.float64)
+        sysOps.throw_status('Performing quantile computation. kneighbors = ' + str(kneighbors)) 
+        num_landmarks = self.shortest_paths_dists.shape[1]
+        index_buffer = -np.ones(num_landmarks,dtype=np.int64)
         
-        my_Npts = end_ind-start_ind
+        if num_landmarks != kneighbors*(2**self.spat_dims):
+            sysOps.throw_status('Error: num_landmarks incorrectly set.')
+            sysOps.exitProgram()
         
-        dotprod_buff = np.zeros(self.spat_dims,dtype=np.float64)
-        diffbuff = np.zeros(collated_dim*(self.max_segment_index+2),dtype=np.float64)
-        ellipsoid_mats = np.zeros([my_Npts,self.spat_dims,self.spat_dims],dtype=np.float64)
-        #sorted_link_data = np.concatenate([self.link_data,
-        #                                  self.link_data[:,np.array([1,0,2])]],axis=0)
-        #sorted_link_data = sorted_link_data[np.argsort(sorted_link_data[:,0]),:]
-        #sorted_link_data_starts = np.append(np.append(0,1+np.where(np.diff(sorted_link_data[:,0])>0)[0]),sorted_link_data.shape[0])
-        
-        get_local_ellipsoids(self.manifold_vecs,self.manifold_coldims,tmp_coldim_lookup_buff,
-                             ellipsoid_mats, self.seg_assignments[:,1], self.pts_seg_starts, self.collated_Xpts,
-                             self.global_coll_indices,self.local_coll_indices,
-                             self.link_data,self.sorted_link_data_inds,self.sorted_link_data_ind_starts,
-                             self.sum_pt_tp1_link,self.sum_pt_tp2_link,
-                             diffbuff,dotprod_buff,self.spat_dims,self.max_segment_index,collated_dim,self.Nassoc,start_ind,end_ind)
-
-        #del sorted_link_data, sorted_link_data_starts
-        np.savetxt(self.path+ "ellipsoid_mats~" + str(start_ind) + "~" + str(end_ind) + "~.txt",ellipsoid_mats.reshape([my_Npts,ellipsoid_mats.shape[1]*ellipsoid_mats.shape[2]]),delimiter=',',fmt='%.10e')
-        
-    def smooth_ellipsoids(self,start_ind,end_ind):
-        sysOps.throw_status('Smoothing ellipsoids ...')
-        my_Npts = end_ind-start_ind
-        newellipsoid_mats = np.zeros([my_Npts,self.spat_dims,self.spat_dims],dtype=np.float64)
-        dotprod_buff = np.zeros([self.spat_dims, self.spat_dims],dtype=np.float64)
-        soln_dims = self.inference_eignum
-        smooth_ellipsoids(self.manifold_vecs,self.manifold_coldims,self.ellipsoid_mats,newellipsoid_mats, self.nn_indices,dotprod_buff,soln_dims,self.spat_dims,self.nn_indices.shape[1]-1,start_ind,end_ind)
-        #del ellipsoid_mats
-        sysOps.throw_status('Inverting ellipsoids ...')
-        for n in range(my_Npts):
-            newellipsoid_mats[n,:,:] = LA.pinv(newellipsoid_mats[n,:,:])
-                
-        np.savetxt(self.path+ "inv_ellipsoid_mats~" + str(start_ind) + "~" + str(end_ind) + "~.txt",newellipsoid_mats.reshape([my_Npts,newellipsoid_mats.shape[1]*newellipsoid_mats.shape[2]]),delimiter=',',fmt='%.10e')
-
-    def quantile_computation(self, start_ind, end_ind):
-        
-        my_Npts = end_ind-start_ind
-        collated_dim = self.inference_eignum
-        sparsity = int(collated_dim)
-        kneighbors = 10*(self.spat_dims)
-        sample_size = int(kneighbors*(2**self.spat_dims))
-        diff_buff = np.zeros(collated_dim*3,dtype=np.float64)
-        Mi_xvec = np.zeros(collated_dim,dtype=np.float64)
-        Mj_xvec = np.zeros(collated_dim,dtype=np.float64)
-        
-        num_quantiles = 2
-        nn_indices_copy = np.array(self.nn_indices[start_ind:end_ind,:]) # will be edited
-        buffsize = max(sample_size+1,nn_indices_copy.shape[1])
-        buffsize = max(buffsize,int(num_quantiles*kneighbors*kneighbors)) # 2 quantiles with memory reserved
-        this_partition_num_assoc = 0
-        max_num_assoc = 0
         for n in range(start_ind,end_ind):
-            this_partition_num_assoc += self.sorted_link_data_ind_starts[n+1]-self.sorted_link_data_ind_starts[n]
-            max_num_assoc = max(max_num_assoc,self.sorted_link_data_ind_starts[n+1]-self.sorted_link_data_ind_starts[n])
-        buffsize += max_num_assoc
-        sampling_buff = np.zeros(buffsize,dtype=np.int64)
-        ref_pts_buff = np.zeros(buffsize,dtype=np.int64)
-        reduced_sampling_buff = np.zeros(buffsize,dtype=np.int64)
-        dist_buff = np.zeros(buffsize,dtype=np.float64)
-        indices_buff = np.zeros(buffsize,dtype=np.int64)
+            index_buffer[:] = np.argsort(self.shortest_paths_dists[n,:])
+            nbr_indices[n-start_ind,:kneighbors] = src_indices[index_buffer[:kneighbors]]
+            nbr_distances[n-start_ind,:] = self.shortest_paths_dists[n,index_buffer[:kneighbors]]
         
-        distances = -np.ones([my_Npts,kneighbors+1,num_quantiles],dtype=np.float64)
-        err_distances = -np.ones([my_Npts,kneighbors+1,num_quantiles],dtype=np.float64)
-        indices = -np.ones([my_Npts,kneighbors+1,num_quantiles],dtype=np.int64)
-        nn_dists = -np.ones([my_Npts,nn_indices_copy.shape[1]],dtype=np.float64)
-        
-        tmp_coldim_lookup_buff = -np.ones(collated_dim*(self.max_segment_index+2),dtype=np.int64)
-                        
-        sysOps.throw_status("Calling get_rand_neighbors() for interval " + str([start_ind, end_ind]))
-        manifold_vecs_buff1 = np.zeros(self.manifold_vecs.shape[1:],dtype=self.manifold_vecs.dtype)
-        manifold_vecs_buff2 = np.zeros(self.manifold_vecs.shape[1:],dtype=self.manifold_vecs.dtype)
-        manifold_coldims_buff1 = np.zeros(self.manifold_coldims.shape[1:],dtype=self.manifold_coldims.dtype)
-        manifold_coldims_buff2 = np.zeros(self.manifold_coldims.shape[1:],dtype=self.manifold_coldims.dtype)
-        inv_ellipsoid_mats_buff1 = np.zeros(self.inv_ellipsoid_mats.shape[1:],dtype=self.inv_ellipsoid_mats.dtype)
-        inv_ellipsoid_mats_buff2 = np.zeros(self.inv_ellipsoid_mats.shape[1:],dtype=self.inv_ellipsoid_mats.dtype)
-        get_rand_neighbors(distances,err_distances,indices,
-                           self.seg_assignments[:,1], self.pts_seg_starts, self.collated_Xpts,
-                           self.global_coll_indices, self.local_coll_indices,
-                           tmp_coldim_lookup_buff,
-                           indices_buff,dist_buff,
-                           ref_pts_buff,reduced_sampling_buff,sampling_buff,
-                           diff_buff,Mi_xvec,Mj_xvec,
-                           self.manifold_vecs,self.manifold_coldims,self.inv_ellipsoid_mats,
-                           nn_dists,nn_indices_copy,manifold_vecs_buff1,manifold_vecs_buff2,manifold_coldims_buff1,manifold_coldims_buff2,inv_ellipsoid_mats_buff1,inv_ellipsoid_mats_buff2,nn_indices_copy.shape[1]-1,
-                           sample_size,num_quantiles,collated_dim,self.max_segment_index,kneighbors,sparsity,start_ind,end_ind,self.Npts,self.Nassoc,self.spat_dims)
-        sysOps.throw_status('Quantile computation completed for indices ' + str([start_ind,end_ind]))
+            index_incr = max(1,int((num_landmarks-kneighbors)/kneighbors))
+            max_nbr_indices[n-start_ind,:] = src_indices[index_buffer[kneighbors:num_landmarks:index_incr][:kneighbors]]
+            max_nbr_distances[n-start_ind,:] = self.shortest_paths_dists[n,index_buffer[kneighbors:num_landmarks:index_incr][:kneighbors]]
                 
-        np.savetxt(self.path + "max_nbr_distances~" + str(start_ind) + "~" + str(end_ind) + "~.txt",distances[:,1:,num_quantiles-1],fmt='%.10e',delimiter=',')
-        np.savetxt(self.path + "max_nbr_err_distances~" + str(start_ind) + "~" + str(end_ind) + "~.txt",err_distances[:,1:,num_quantiles-1],fmt='%.10e',delimiter=',')
-        np.savetxt(self.path + "max_nbr_indices~" + str(start_ind) + "~" + str(end_ind) + "~.txt",indices[:,1:,num_quantiles-1],fmt='%i',delimiter=',')
-        np.savetxt(self.path + "nbr_distances_0~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nn_dists[:,1:(kneighbors+1)],fmt='%.10e',delimiter=',')
-        np.savetxt(self.path + "nbr_indices_0~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nn_indices_copy[:,1:(kneighbors+1)],fmt='%i',delimiter=',')
-                        
-        # assign association quantiles
-        quantiles_dists = -np.ones([my_Npts,num_quantiles+1],dtype=np.float64)
-        for n in range(my_Npts):
-            quantiles_dists[n,0] = np.mean(nn_dists[n,1:(kneighbors+1)])
-            for q in range(num_quantiles):
-                if np.sum(distances[n,:,q]>0)>0:
-                    quantiles_dists[n,q+1] = np.mean(distances[n,1:,q][distances[n,1:,q]>0])
-        np.savetxt(self.path + "lengthscales~" + str(start_ind) + "~" + str(end_ind) + "~.txt",quantiles_dists,fmt='%.10e',delimiter=',')
-        
-        for q in range(num_quantiles-1):
-            print(str(distances[:,:,q]))
-            np.savetxt(self.path + "nbr_distances_" + str(q+1) + "~" + str(start_ind) + "~" + str(end_ind) + "~.txt",distances[:,1:,q],fmt='%.10e',delimiter=',')
-            np.savetxt(self.path + "nbr_err_distances_" + str(q+1) + "~" + str(start_ind) + "~" + str(end_ind) + "~.txt",err_distances[:,1:,q],fmt='%.10e',delimiter=',')
-            np.savetxt(self.path + "nbr_indices_" + str(q+1) + "~" + str(start_ind) + "~" + str(end_ind) + "~.txt",indices[:,1:,q],fmt='%i',delimiter=',')
-        del distances, indices, nn_indices_copy
-                          
+        np.savetxt(self.path+ "nbr_distances_1~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nbr_distances,delimiter=',',fmt='%.10e')
+        np.savetxt(self.path+ "nbr_indices_1~" + str(start_ind) + "~" + str(end_ind) + "~.txt",nbr_indices,delimiter=',',fmt='%i')
+        np.savetxt(self.path+ "max_nbr_distances~" + str(start_ind) + "~" + str(end_ind) + "~.txt",max_nbr_distances,delimiter=',',fmt='%.10e')
+        np.savetxt(self.path+ "max_nbr_indices~" + str(start_ind) + "~" + str(end_ind) + "~.txt",max_nbr_indices,delimiter=',',fmt='%i')
     
     def SL_cluster(self):
         # SL_cluster returns disjoint data-sets (single-linkage clustering based on the presence/absence of associations in the array self.link_data
@@ -3671,11 +3233,9 @@ class GSEobj:
         do_hessp=(inp_vec is not None)
         
         if self.reweighted_Nlink is None: # not yet initiated
-        
+            
             self.Xpts = np.zeros((self.Npts,self.spat_dims),dtype=np.float64)
             
-            self.reweighted_sum_pt_tp1_link = np.zeros(self.Npts,dtype=np.float64)
-            self.reweighted_sum_pt_tp2_link = np.zeros(self.Npts,dtype=np.float64)
             self.reweighted_sum_pt_tp1_ampfactors = np.zeros(self.Npts,dtype=np.float64)
             self.reweighted_sum_pt_tp2_ampfactors = np.zeros(self.Npts,dtype=np.float64)
                 
@@ -3684,39 +3244,40 @@ class GSEobj:
             # initialize dot product for later use
                             
             vals = np.concatenate([self.link_data[:,2],self.link_data[:,2]])
-            rows = np.concatenate([np.int64(self.link_data[:,0]), np.int64(self.link_data[:,1])])
-            cols = np.concatenate([np.int64(self.link_data[:,1]), np.int64(self.link_data[:,0])])
+            rows = np.concatenate([np.int32(self.link_data[:,0]), np.int32(self.link_data[:,1])])
+            cols = np.concatenate([np.int32(self.link_data[:,1]), np.int32(self.link_data[:,0])])
             csc = csc_matrix((vals, (rows, cols)), (self.Npts, self.Npts))
-            
+            del vals,rows,cols
+            sysOps.throw_status('Calculating self.gl_innerprod')
             vals = csc.dot(np.ones(self.Npts,dtype=np.float64)) # row-sums
+            
+            normalized_vals = csc.dot(np.divide(1.0,vals))
+            
             self.gl_innerprod = self.seq_evecs.dot(csc.dot( self.seq_evecs.T))
                                                     
-            self.reweighted_sum_pt_tp1_link = 0.5*vals
-            self.reweighted_sum_pt_tp2_link = 0.5*vals
+            reweighted_sum_pt_tp1_link = 0.5*vals
+            reweighted_sum_pt_tp2_link = 0.5*vals
             self.reweighted_Nlink = np.sum(vals)*0.5
-            rows = np.arange(self.Npts,dtype=np.int64)
-            cols = np.arange(self.Npts,dtype=np.int64)
+            rows = np.arange(self.Npts,dtype=np.int32)
+            cols = np.arange(self.Npts,dtype=np.int32)
             
+            sysOps.throw_status('Calculating self.gl_diag')
+
             csc = csc_matrix((vals, (rows, cols)), (self.Npts, self.Npts)) # getting left
+            del vals,rows,cols
             self.gl_diag = self.seq_evecs.dot(csc.dot( self.seq_evecs.T))
-            self.reweighted_sum_pt_tp1_ampfactors[self.reweighted_sum_pt_tp1_link > 0] = 1.0+ 0.5*np.log(self.reweighted_sum_pt_tp1_link[self.reweighted_sum_pt_tp1_link > 0])
-            self.reweighted_sum_pt_tp2_ampfactors[self.reweighted_sum_pt_tp2_link > 0] = 1.0+ 0.5*np.log(self.reweighted_sum_pt_tp2_link[self.reweighted_sum_pt_tp2_link > 0])
+            del csc
+
+            sqdisps = np.load(sysOps.globaldatapath + 'sqdisps.npy')
+            sqdisps = np.clip(sqdisps, np.percentile(sqdisps, 1), np.percentile(sqdisps, 99))
+            sqdisps -= np.mean(sqdisps)
+            sqdisps /= np.sqrt(np.var(sqdisps))
             
-            tmp_subsample_pairings = np.load(sysOps.globaldatapath + "subsample_pairings.npy")
-            tmp_subsample_pairings =  csc_matrix((tmp_subsample_pairings[:,2], (np.int64(tmp_subsample_pairings[:,0]), np.int64(tmp_subsample_pairings[:,1]))), (self.Npts, self.Npts))
-            tmp_subsample_pairings.sum_duplicates()
-                
-            self.subsample_pairing_weights = np.array(tmp_subsample_pairings.data)
-            self.subsample_pairings = -np.ones([tmp_subsample_pairings.indices.shape[0],2],dtype=np.int64)
-            self.subsample_pairings[:,0] = tmp_subsample_pairings.indices
-            for i in range(tmp_subsample_pairings.indptr.shape[0]-1):
-                self.subsample_pairings[tmp_subsample_pairings.indptr[i]:tmp_subsample_pairings.indptr[i+1],1] = i
+            self.reweighted_sum_pt_tp1_ampfactors[reweighted_sum_pt_tp1_link > 0] =  0.5*(-sqdisps[reweighted_sum_pt_tp1_link > 0] + np.log(normalized_vals[reweighted_sum_pt_tp1_link > 0]))
+            self.reweighted_sum_pt_tp2_ampfactors[reweighted_sum_pt_tp2_link > 0] =  0.5*(-sqdisps[reweighted_sum_pt_tp2_link > 0] + np.log(normalized_vals[reweighted_sum_pt_tp2_link > 0]))
+            del reweighted_sum_pt_tp1_link, reweighted_sum_pt_tp2_link, sqdisps
+            
             self.sub_pairing_count = int(2*(self.spat_dims+1)*self.Npts)
-            self.pairing_subsample = np.zeros(self.sub_pairing_count,dtype=np.int64)
-            
-            self.subsample_pairing_weights = np.multiply(self.subsample_pairing_weights, np.exp(np.add(self.reweighted_sum_pt_tp1_ampfactors[self.subsample_pairings[:,0]],self.reweighted_sum_pt_tp2_ampfactors[self.subsample_pairings[:,1]])))
-            
-            del csc, vals, rows, cols
             
             self.hessp_output = np.zeros([self.Npts,self.spat_dims],dtype=np.float64)
             self.out_vec_buff = np.zeros([self.Npts,self.spat_dims],dtype=np.float64)
@@ -3725,8 +3286,6 @@ class GSEobj:
             self.sum_wvals = np.zeros([self.Npts,self.spat_dims],dtype=np.float64)
             self.sumw = 0
                 
-            np.savetxt(sysOps.globaldatapath + "reweighted_sum_pt_tp1_link.txt",self.reweighted_sum_pt_tp1_link,delimiter=',',fmt='%.10e')
-            np.savetxt(sysOps.globaldatapath + "reweighted_sum_pt_tp2_link.txt",self.reweighted_sum_pt_tp2_link,delimiter=',',fmt='%.10e')
         
         X = X.reshape([self.inference_eignum,self.spat_dims])
         if do_hessp:
@@ -3748,13 +3307,65 @@ class GSEobj:
         log_likelihood = 0.0
         if self.reset_subsample:
             self.reset_subsample = False
-            self.pairing_subsample[:] = np.random.choice(self.subsample_pairings.shape[0],self.sub_pairing_count,replace=False)
-        subsample_pairing_weights = self.subsample_pairing_weights[self.pairing_subsample]
-        subsample_pairings = self.subsample_pairings[self.pairing_subsample,:]
-    
+            num_quantiles = 2 
+            nnz_counts = list()
+            for q in range(num_quantiles+1):
+                if not sysOps.check_file_exists("nnz_" +str(q) + ".txt"):
+                    sysOps.throw_status("Writing " + sysOps.globaldatapath + "nnz_" +str(q) + ".txt")
+                    with open(sysOps.globaldatapath + "nnz_" +str(q) + ".txt",'w') as nnzfile:
+                        nnzfile.write(str(load_npz(sysOps.globaldatapath + "subsample_pairings_" +str(q) + ".npz").data.shape[0]))
+                nnz_counts.append(int(np.loadtxt(sysOps.globaldatapath + "nnz_" +str(q) + ".txt")))
+            nnz_counts = np.array(nnz_counts)
+            
+                            
+            try:
+                os.mkdir(sysOps.globaldatapath + "subsample_pairings")
+            except:
+                pass
+            
+            # determine subsample files that will be required
+            subsample_eignums_to_write = list()
+            sub_nnz_counts = list()
+            if not sysOps.check_file_exists("subsample_pairings/rand_subsample_pairings_" + str(self.inference_eignum) + "_0.npy"):
+                eignum = int(self.inference_eignum)
+                while eignum <= min(self.seq_evecs.shape[0], self.inference_eignum + self.spat_dims*10): # write 10 random sub-samplings (to maintain efficiency)
+                    subsample_eignums_to_write.append(str(eignum))
+                    sub_nnz_counts.append(np.random.multinomial(self.sub_pairing_count, nnz_counts/np.sum(nnz_counts)))
+                    eignum += self.spat_dims
+                    
+            if len(sub_nnz_counts) > 0:
+                for q in range(num_quantiles+1):
+                    tmp_csc = load_npz(sysOps.globaldatapath + "subsample_pairings_" +str(q) + ".npz")
+                    tmp_csc.indptr = np.int64(tmp_csc.indptr)
+                    tmp_csc.indices = np.int64(tmp_csc.indices)
+                    tmp_csc.data = np.float64(tmp_csc.data)
+                    for rand_sample in range(len(sub_nnz_counts)):
+                        subsample_pairing_weights = np.zeros(sub_nnz_counts[rand_sample][q],dtype=np.float64)
+                        subsample_pairings = -np.ones([sub_nnz_counts[rand_sample][q],2],dtype=np.int32)
+                        pairing_subsample = np.int64(np.sort(np.random.choice(nnz_counts[q],sub_nnz_counts[rand_sample][q],replace=False)))
+                        map_indices_to_coo(subsample_pairings, subsample_pairing_weights, tmp_csc.indptr, tmp_csc.indices, tmp_csc.data, pairing_subsample,  sub_nnz_counts[rand_sample][q])
+                        np.save(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairings_" + subsample_eignums_to_write[rand_sample] + "_" + str(q) + ".npy",subsample_pairings)
+                        np.save(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairing_weights_" + subsample_eignums_to_write[rand_sample] + "_" + str(q) + ".npy",subsample_pairing_weights)
+                        del subsample_pairing_weights, subsample_pairings, pairing_subsample
+                    del tmp_csc
+                                            
+            self.subsample_pairing_weights = list()
+            self.subsample_pairings = list()
+            for q in range(num_quantiles+1):
+                self.subsample_pairings.append(np.load(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairings_" + str(self.inference_eignum) + "_" + str(q) + ".npy"))
+                self.subsample_pairing_weights.append(np.load(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairing_weights_" + str(self.inference_eignum) + "_" + str(q) + ".npy"))
+            self.subsample_pairing_weights = np.concatenate(self.subsample_pairing_weights)
+            self.subsample_pairings = np.concatenate(self.subsample_pairings,axis=0)
+            for q in range(num_quantiles+1):
+                os.remove(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairings_" + str(self.inference_eignum) + "_" + str(q) + ".npy")
+                os.remove(sysOps.globaldatapath + "subsample_pairings/rand_subsample_pairing_weights_" + str(self.inference_eignum) + "_" + str(q) + ".npy")
+                
+            sysOps.throw_status('Multiplying amplification factors: ' + str([self.reweighted_sum_pt_tp1_ampfactors.shape,self.reweighted_sum_pt_tp2_ampfactors.shape,np.max(self.subsample_pairings,axis=0),self.Npts]))
+            self.subsample_pairing_weights = np.multiply(self.subsample_pairing_weights,np.exp(np.add(self.reweighted_sum_pt_tp1_ampfactors[self.subsample_pairings[:,0]],self.reweighted_sum_pt_tp2_ampfactors[self.subsample_pairings[:,1]])))
+
         if do_grad:
         
-            self.sumw = get_dxpts(subsample_pairings, subsample_pairing_weights, self.w_buff, self.dXpts_buff, self.Xpts, subsample_pairings.shape[0], self.spat_dims)
+            self.sumw = get_dxpts(self.subsample_pairings, self.subsample_pairing_weights, self.w_buff, self.dXpts_buff, self.Xpts, self.subsample_pairings.shape[0], self.spat_dims)
             log_likelihood += -np.log(self.sumw)*self.reweighted_Nlink
             for d in range(self.spat_dims):
                 log_likelihood -= np.sum(X[:,d].dot(self.gl_diag[:self.inference_eignum,:self.inference_eignum].dot(X[:,d])))
@@ -3763,7 +3374,7 @@ class GSEobj:
                 dX[:,d] -= 2.0*np.subtract(self.gl_diag[:self.inference_eignum,:self.inference_eignum].dot(X[:,d]), self.gl_innerprod[:self.inference_eignum,:self.inference_eignum].dot(X[:,d]))
                 
         if do_hessp:
-            get_hessp(self.hessp_output, self.out_vec_buff, subsample_pairings, self.w_buff, self.dXpts_buff, self.Xpts, self.sum_wvals, inp_vec_pts, self.sumw, subsample_pairings.shape[0], 1.0, self.spat_dims, self.Npts)
+            get_hessp(self.hessp_output, self.out_vec_buff, self.subsample_pairings, self.w_buff, self.dXpts_buff, self.Xpts, self.sum_wvals, inp_vec_pts, self.sumw, self.subsample_pairings.shape[0], 1.0, self.spat_dims, self.Npts)
             hessp[:,:] += self.reweighted_Nlink*(self.seq_evecs[:self.inference_eignum,:].dot(self.hessp_output))
             hessp[:,:] -= 2.0*np.subtract(self.gl_diag[:self.inference_eignum,:self.inference_eignum].dot(inp_vec), self.gl_innerprod[:self.inference_eignum,:self.inference_eignum].dot(inp_vec))
     
@@ -3777,127 +3388,161 @@ class GSEobj:
         return self.calc_grad_and_hessp(X,None)
     
     def calc_hessp(self,X,inp_vec):
-                
+    
         return self.calc_grad_and_hessp(X,inp_vec)
         
     def generate_final_eigenbasis(self,q):
-        
+        if sysOps.check_file_exists('pseudolink_assoc_' + str(q) + '_reindexed.npz'):
+            sysOps.throw_status('Found ' + 'pseudolink_assoc_' + str(q) + '_reindexed.npz')
+            return
+
         indices = list()
         distances = list()
-        is_this_q = list()
         is_nn = list()
         
-        indices = np.load(sysOps.globaldatapath + "nbr_indices.npy")
+        indices = np.int32(np.load(sysOps.globaldatapath + "nbr_indices.npy"))
         distances = np.load(sysOps.globaldatapath + "nbr_distances.npy")[:,:,:2]
+                        
         for myq in range(2):
-            is_this_q.append(np.ones(indices.shape[1],dtype=np.bool_)*(myq == q))
             is_nn.append(np.ones(indices.shape[1],dtype=np.bool_)*(myq == 0))
-            
+                    
+        #weights = np.load(sysOps.globaldatapath + "nbr_weights.npy")[:,:,0] # first array layer pertains to the bottom-quantile (non-nn)
+        
+        #weights = np.concatenate([np.outer(np.sum(weights,axis=1),np.ones(weights.shape[1],dtype=np.float32)),weights],axis=1) # equal weight between nn and non-nn
+        if q == 0:
+            np.save(sysOps.globaldatapath + "sqdisps.npy",np.mean(np.square(distances[:,:,1]),axis=1))
+
         indices = np.concatenate([indices[:,:,0],indices[:,:,1]],axis=1)
         distances = np.concatenate([distances[:,:,0],distances[:,:,1]],axis=1)
-        is_this_q = np.concatenate(is_this_q)
+        
         is_nn = np.concatenate(is_nn)
         distances[indices < 0] = -1
-                    
+        
+        EPS = 1E-10
         sqdisps = np.zeros(self.Npts,dtype=np.float64)
+
         non_neg = np.zeros(distances.shape[1],dtype=np.bool_)
         for n in range(self.Npts):
-            non_neg[is_this_q] = (distances[n,is_this_q] >= 0)
-            if np.sum(non_neg[is_this_q]) > 0:
-                sqdisps[n] = np.mean(np.square(distances[n,is_this_q][non_neg[is_this_q]]))
+            non_neg[is_nn] = np.multiply(distances[n,is_nn] >= 0, ~np.isinf(distances[n,is_nn]))
+            if np.sum(non_neg[is_nn]) > 0:
+                mean_closest = 1E-10 + np.partition(np.square(distances[n,is_nn][non_neg[is_nn]]), self.spat_dims)[self.spat_dims]
+                sqdisps[n] = mean_closest
             else:
-                sqdisps[n] = -1
-                
-        prev_assigned = -1
-        tmp_sqdisps = np.zeros(1 + distances.shape[1],dtype=np.float64)
-        while True:
-            assigning = np.sum(sqdisps <= 0)
-            sysOps.throw_status('Assigning ' + str(assigning) + ' densities...')
-            if prev_assigned == assigning:
-                sqdisps[sqdisps <= 0] = np.min(sqdisps[sqdisps > 0])
-            if assigning == 0 or prev_assigned == assigning:
-                break
-            sqdisps_arr = np.zeros(self.Npts,dtype=np.float64)
-            for n in range(self.Npts):
-                num_non_neg = np.sum(distances[n,is_nn]>0)
-                if num_non_neg > 0:
-                    tmp_sqdisps[0] = sqdisps[n]
-                    tmp_sqdisps[1:(num_non_neg+1)] = sqdisps[indices[n,is_nn][distances[n,is_nn]>0]]
-                    if np.sum(tmp_sqdisps[:(num_non_neg+1)] > 0) > 0:
-                        if q == 0:
-                            divisor = np.power(num_non_neg,2.0/self.spat_dims)
-                        else:
-                            divisor = 1.0
-                        sqdisps_arr[n] = np.median(tmp_sqdisps[:(num_non_neg+1)][tmp_sqdisps[:(num_non_neg+1)] > 0])/divisor
-            sqdisps[sqdisps <= 0] = sqdisps_arr[sqdisps <= 0]
-            prev_assigned = int(assigning)
-        sysOps.throw_status('Done.')
-        
-        indices = np.concatenate([np.arange(self.Npts,dtype=np.int64).reshape((self.Npts,1)),indices],axis=1)
-        distances = np.concatenate([np.zeros(self.Npts,dtype=np.float64).reshape((self.Npts,1)),distances],axis=1)
+                sqdisps[n] = np.inf
+ 
+        sysOps.throw_status('Done. [min(sqdisps), max(sqdisps)] = ' + str([np.min(sqdisps),np.max(sqdisps)]))
+                        
         sq_args = np.zeros(distances.shape[1],dtype=np.float64)
         k = indices.shape[1]
-        row_indices = np.arange(self.Npts + self.Npts*k, dtype=np.int64)
-        col_indices = np.arange(self.Npts + self.Npts*k, dtype=np.int64)
-        pseudolinks = np.zeros(self.Npts + self.Npts*k, dtype=np.float64)
+        
+        row_indices = -np.ones(self.Npts*k, dtype=np.int32)
+        col_indices = -np.ones(self.Npts*k, dtype=np.int32)
+        pseudolinks = np.zeros(self.Npts*k, dtype=np.float64)
+        
+        try:
+            sysOps.sh("rm try1")
+        except:
+            pass
+        
         get_pseudolinks(distances,indices,sqdisps,row_indices,col_indices,pseudolinks,sq_args,self.spat_dims,k,self.Npts)
         
-        save_npz(sysOps.globaldatapath + 'pseudolink_assoc_' + str(q) + '_reindexed.npz', csc_matrix((pseudolinks[self.Npts:],(row_indices[self.Npts:],col_indices[self.Npts:])),(self.Npts,self.Npts)))
+        try:
+            sysOps.sh("rm try2")
+        except:
+            pass
         
-        del sqdisps, indices, distances, pseudolinks, row_indices, col_indices # clean up memory before eigendecomposition
+        sysOps.throw_status('Writing ' + sysOps.globaldatapath + 'pseudolink_assoc_' + str(q) + '_reindexed.npz')
+        del sqdisps, indices, distances
+            
+        # reduce memory footproint
+        row_indices = row_indices[pseudolinks > 1E-10]
+        col_indices = col_indices[pseudolinks > 1E-10]
+        pseudolinks = pseudolinks[pseudolinks > 1E-10]
+
+        sysOps.throw_status('np.sum(pseudolinks) = ' + str(np.sum(pseudolinks)))
+        
+        save_npz(sysOps.globaldatapath + 'pseudolink_assoc_' + str(q) + '_reindexed.npz', scipy.sparse.csc_matrix((pseudolinks,(row_indices,col_indices)), shape=(self.Npts, self.Npts))) # save as coo_matrix to avoid creating memory copy here
+        del pseudolinks, row_indices, col_indices # clean up memory before eigendecomposition
         
         return
 
 class dot2:
-    def __init__(self,csc_op1,csc_op2,csc_op3):
+    def __init__(self,csc_op1,csc_op2):
         self.csc_op1 = csc_op1
         self.csc_op2 = csc_op2
-        self.csc_op3 = csc_op3
-        self.coef = np.zeros(self.csc_op1.shape[0],dtype=np.float64)
-        self.coef = self.makedot(np.ones(self.csc_op1.shape[0],dtype=np.float64))
+        self.coef = np.zeros([self.csc_op1.shape[0],1],dtype=np.float64)
+        self.xbuff = np.zeros([self.csc_op1.shape[0],1],dtype=np.float64)
+        self.coef[:] = self.makedot(np.ones((self.csc_op1.shape[0],1),dtype=np.float64))
+        
+    def makedot(self,x,subtract_diag=True):
+        res = 0
+        if len(x.shape) == 1:
+            self.xbuff[:,0] = x
+            res = self.csc_op1.dot(self.xbuff)
+            for el in self.csc_op2:
+                res[:] = el.dot(res)
+            return np.subtract(res,np.multiply(self.xbuff,self.coef))
+        
+        res = self.csc_op1.dot(x)
+        for el in self.csc_op2:
+            res[:] = el.dot(res)
+        
+        if subtract_diag:
+            return np.subtract(res,np.multiply(x,self.coef))
+        return res
 
-    def makedot(self,x):
-        if self.csc_op3 is not None:
-            res = self.csc_op3.dot(self.csc_op1.dot(x))
-            #res += self.csc_op2[1].dot(self.csc_op1.dot(x))
-        else:
-            res = self.csc_op2[0].dot(self.csc_op1.dot(x))
-            res += self.csc_op2[1].dot(self.csc_op1.dot(x))
-        return np.subtract(res,np.multiply(self.coef,x))
+@njit("void(int32[:,:], float64[:], int64[:], int64[:], float64[:], int64[:], int64)")
+def map_indices_to_coo(out_rows_and_cols, out_data, indptr, indices, data, pairing_subsample, num_pairings):
+    
+    col = 0  # Start from the first column
+    for i in range(num_pairings):
+        while col < len(indptr) - 1 and indptr[col + 1] <= pairing_subsample[i]:
+            col += 1
+        idx = pairing_subsample[i]
+        out_rows_and_cols[i,0] = np.int32(indices[idx]) # taking into account that this may be a int64 --> int32 assignment
+        out_rows_and_cols[i,1] = np.int32(col)
+        out_data[i] = data[idx]
         
-@njit("void(float64[:,:], int64[:,:], float64[:], int64[:], int64[:], float64[:], float64[:], int64, int64, int64)",fastmath=True)
+    return
+        
+            
+@njit("void(float64[:,:], int32[:,:], float64[:], int32[:], int32[:], float64[:], float64[:], int64, int64, int64)")
 def get_pseudolinks(distances,indices,sqdisps,row_indices,col_indices,pseudolinks,sq_args,spat_dims,k,Npts):
-        
+    
     for n in range(Npts):
-        row_indices[n] = n
-        col_indices[n] = n
-        pseudolinks[n] = 0.0
-        sq_args[:] = 0.0
-        mymin = -1
+        # assumes distances pre-sorted
+    
+        sq_args[:k] = 0.0
+        mymin = np.inf
+        prev_dist = 0
         for j in range(k):
             if distances[n,j] >= 0:
-                sq_args[j] = (distances[n,j]**2)/(sqdisps[n] + sqdisps[indices[n,j]])
-                if mymin < 0 or mymin > sq_args[j]:
+                sq_args[j] = ((distances[n,j]**2)/(1E-10 + sqdisps[n] + sqdisps[indices[n,j]]))
+                if mymin > sq_args[j]:
                     mymin = sq_args[j]
                 
         for j in range(k):
             if distances[n,j] >= 0:
-                sq_args[j] = np.exp(-(sq_args[j]-mymin))*np.power((sqdisps[n] + sqdisps[indices[n,j]])/np.sqrt(sqdisps[indices[n,j]]),-spat_dims/2.0)
+                sq_args[j] = np.exp(-(sq_args[j]-mymin))
         
-        sq_args[:] /= np.sum(sq_args[:])
-
+        rownorm = np.sum(sq_args[:k])
+        if rownorm > 0:
+            sq_args[:k] /= np.sum(sq_args[:k])
+        else:
+            sq_args[0] = 1.0
+                        
         for myk in range(k):
-            row_indices[Npts + k*n + myk] = n
+            row_indices[k*n + myk] = n
             if distances[n,myk] >= 0:
-                col_indices[Npts + k*n + myk] = indices[n,myk]
-                pseudolinks[Npts + k*n + myk] = sq_args[myk]
+                col_indices[k*n + myk] = indices[n,myk]
+                pseudolinks[k*n + myk] = sq_args[myk]
             else:
-                col_indices[Npts + k*n + myk] = n # corresponding sq_args will already be set to zero
-                pseudolinks[Npts + k*n + myk] = 0.0
+                col_indices[k*n + myk] = n # corresponding sq_args will already be set to zero
+                pseudolinks[k*n + myk] = 0.0
             
     return
 
-@njit("float64(int64[:,:], float64[:], float64[:,:], float64[:,:], float64[:,:], int64, int64)",fastmath=True)
+@njit("float64(int32[:,:], float64[:], float64[:,:], float64[:,:], float64[:,:], int64, int64)",fastmath=True)
 def get_dxpts(subsample_pairings, subsample_pairing_weights, w_buff, dXpts_buff, Xpts, pairing_num, spat_dims):
 
     w_buff[:,:spat_dims] = np.subtract(Xpts[subsample_pairings[:,0],:],Xpts[subsample_pairings[:,1],:])
@@ -3915,7 +3560,7 @@ def get_dxpts(subsample_pairings, subsample_pairing_weights, w_buff, dXpts_buff,
                 
     return sumw
     
-@njit("void(float64[:,:], float64[:,:], int64[:,:], float64[:,:], float64[:,:], float64[:,:], float64[:,:], float64[:,:], float64, int64, float64, int64, int64)",fastmath=True)
+@njit("void(float64[:,:], float64[:,:], int32[:,:], float64[:,:], float64[:,:], float64[:,:], float64[:,:], float64[:,:], float64, int64, float64, int64, int64)",fastmath=True)
 def get_hessp(out_vec, out_vec_buff, subsample_pairings, w_buff, dXpts_buff, Xpts, sum_wvals, inp_vec, sumw, pairing_num, lengthscale, spat_dims, Npts):
     
     out_vec[:,:] = 0.0
@@ -3997,35 +3642,72 @@ def min_contig_edges(index_link_array,dataset_index_array,link_data,Nassoc):
                     min_index_links_changed += 1
                 
     return
+    
+@jit("void(int64[:],float64[:,:],float64[:,:],int64[:],int64[:],int64[:],int64,int64)",nopython=True)
+def assign_orphans(seg_assignments,ctr_coords,coords,segment_bins,randbuff,ctr_indices,num_ctrs,Npts):
+    
+    randbuff[:] = np.random.permutation(Npts)
+    
+    for n in randbuff:
+        if seg_assignments[n] < 0:
+            min_dist = -1
+            for j in ctr_indices:
+                pt_dist = LA.norm(ctr_coords[:,j]-coords[:,n])
+                if min_dist < 0 or min_dist > pt_dist:
+                    min_dist = float(pt_dist)
+                    seg_assignments[n] = j
+                    segment_bins[j] += 1
 
-@jit("void(int64[:],int64[:],float64[:,:],float64[:,:],int64[:],int64[:],int64[:],int64,int64,int64)",nopython=True)
-def assign_orphans(seg_assignments,seg_assignments_buff,coords,link_data,sorted_link_data_inds,sorted_link_data_ind_starts,segment_bins,min_seg_size,Npts,Nassoc):
-    while True:
-        tot_orphans = 0
-        for n in range(Npts):
-            seg_assignments_buff[n] = seg_assignments[n]
-        for n in range(Npts):
-            if segment_bins[seg_assignments[n]] < min_seg_size:
-                min_seg_dist = -1
-                seg_choice = -1
-                for i in range(sorted_link_data_ind_starts[n],sorted_link_data_ind_starts[n+1]):
-                    # GSEobj.sorted_link_data_inds will consist of indices that order the non-stored vector np.concatenate([link_data[:,0], link_data[:,1]]) for the first
-                    # link_data.shape[0] rows by the first column and the second link_data.shape[0] rows by the second column; GSEobj.sorted_link_data_ind_starts will provide locations of where new indices start in this ordering
-                    other_pt = int(link_data[sorted_link_data_inds[i]%Nassoc,int(sorted_link_data_inds[i] < Nassoc)])
-                    if (segment_bins[seg_assignments_buff[other_pt]] >= min_seg_size):
-                        pt_dist = LA.norm(coords[other_pt,:]-coords[n,:])
-                        if min_seg_dist < 0 or min_seg_dist > pt_dist:
-                            min_seg_dist = float(pt_dist)
-                            seg_choice = seg_assignments_buff[other_pt]
-                if seg_choice >= 0:
-                    seg_assignments[n] = seg_choice
-                else:
-                    tot_orphans += 1
-                
-        segment_bins[:] = 0
-        for n in range(Npts):
-            segment_bins[seg_assignments[n]] += 1
-        if tot_orphans == 0:
-            break
+    return
+        
+@njit("void(float64[:,:],int32[:],float64[:,:],float64[:,:],int64[:,:], int32[:], int32[:], float64[:], float64[:], int64,int64,int64)")
+def assign_clusters(coords, assignments, centroids, nn_distances, nn_indices, cluster_sizes, new_cluster_sizes, prob_buff, buff, Npts, nn_num, k_ctrs):
+    centroids[:,:] = 0.0
+    new_cluster_sizes[:] = 0
+    for n in range(Npts):
+        buff[:] = 0
+        for k in range(nn_num):
+            prob_buff[k] = 1.0/((1E-10 + nn_distances[n,k])*(1E-10 + cluster_sizes[nn_indices[n,k]]))
+            if k == 0:
+                buff[k] = prob_buff[k]
+            else:
+                buff[k] = buff[k-1] + prob_buff[k]
+        buff[:] /= buff[nn_num-1]
+        rand_val = np.random.rand()
+        for k in range(nn_num):
+            if rand_val <= buff[k]:
+                assignments[n] = nn_indices[n,k]
+                break
+            
+        new_cluster_sizes[assignments[n]] += 1
+        centroids[assignments[n],:] += coords[n,:]
+
+    for k in range(k_ctrs):
+        if new_cluster_sizes[k] > 0:
+            centroids[k,:] /= float(new_cluster_sizes[k])
+    
     return
 
+def stochastic_kmeans(data, k, minpts, max_iter=10):
+    # Randomly initialize centroids
+    sysOps.throw_status('Initiating stochastic k-means with k=' + str(k))
+    
+    centroids = data[np.random.choice(data.shape[0], k, replace=False), :]
+    assignments = np.zeros(data.shape[0], dtype=np.int32)
+    cluster_sizes = np.zeros(k,dtype=np.int32)
+    new_cluster_sizes = np.zeros(k,dtype=np.int32) 
+    for iteration in range(max_iter):
+        sysOps.throw_status('Performing stochastic_kmeans iteration ' + str(iteration) + ', ' + str(np.sum(cluster_sizes>=minpts)) + ' clusters with size >= ' + str(minpts))
+        assignments[:] = -1
+        # Compute distances between data points and centroids
+        nbrs = NearestNeighbors(n_neighbors=min(k,data.shape[1])).fit(centroids)
+        nn_distances, nn_indices = nbrs.kneighbors(data)
+        nn_distances += 1E-10 
+        sysOps.throw_status('Distances calculated.')
+        prob_buff = -np.ones(k, dtype=np.float64)
+        buff = -np.ones(k, dtype=np.float64)
+        new_cluster_sizes[:] = 0
+        assign_clusters(data, assignments, centroids, nn_distances, nn_indices, cluster_sizes, new_cluster_sizes, prob_buff, buff, data.shape[0], nn_indices.shape[1],k)
+        cluster_sizes[:] = new_cluster_sizes[:]
+        
+    return assignments
