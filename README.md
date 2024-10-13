@@ -28,7 +28,7 @@ Weinstein, J. A., Regev, A., & Zhang, F. (2019). DNA microscopy: optics-free spa
 Fastq's can most easily be downloaded [here](https://uchicago.box.com/s/go4vhae97to7ozu4nwdcq77eah1tlf6x).
 
 ## Documentation
-For detailed usage instructions, parameter explanations, and troubleshooting tips, please refer to the [vdnamic_documentation.pdf](https://github.com/wlab-bio/vdnamic/blob/main/vdnamic_documentation.pdf).
+For detailed usage instructions, parameter explanations, and troubleshooting tips, please refer to the [Documentation](https://github.com/wlab-bio/vdnamic/blob/main/vdnamic_documentation.pdf).
 
 ## Requirements
 - Python 3.8+
