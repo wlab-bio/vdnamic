@@ -27,6 +27,8 @@ For detailed usage instructions, parameter explanations, and troubleshooting tip
 - Python 3.8+
 - NumPy, SciPy, Pandas, Biopython
 - STAR Aligner 2.7.9a+
+- awk
+- bioawk
 
 ## Citation
 If you use vDNAmic in your research, please cite:
