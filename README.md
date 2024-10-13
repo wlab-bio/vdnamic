@@ -1,0 +1,39 @@
+# vDNAmic Pipeline
+
+## Overview
+vDNAmic is a comprehensive data analysis pipeline for DNA microscopy experiments. It provides tools for processing raw sequencing data, performing spatial reconstruction, and analyzing gene expression profiles.
+
+## Key Features
+- Quality control and filtering of raw sequencing reads
+- UMI/UEI extraction and clustering
+- Consensus sequence assembly
+- Spatial reconstruction using Geodesic Spectral Embedding (GSE)
+- Integration with genome alignment tools
+
+## Quick Start
+1. Clone the repository:
+git clone https://github.com/wlab-bio/vdnamic.git
+2. Install dependencies:
+pip install -r requirements.txt
+3. Run the sequence analysis:
+python main.py lib /path/to/data//
+4. Perform spatial reconstruction:
+python main.py GSE -path /path/to/data//uei_grp0// -inference_dim 3 -inference_eignum 25 -final_eignum 225
+
+## Documentation
+For detailed usage instructions, parameter explanations, and troubleshooting tips, please refer to the vdnamic_documentation.pdf.
+
+## Requirements
+- Python 3.8+
+- NumPy, SciPy, Pandas, Biopython
+- STAR Aligner 2.7.9a+
+
+## Citation
+If you use vDNAmic in your research, please cite:
+Qian, N., & Weinstein, J. A. (2023). Volumetric imaging of an intact organism by a distributed molecular network. bioRxiv. https://doi.org/10.1101/2023.08.11.553025
+
+## License
+This project is licensed under the MIT License.
+
+## Contact
+For questions and support, please contact jaweinst@uchicago.edu.
