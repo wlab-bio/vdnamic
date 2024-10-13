@@ -1,0 +1,9 @@
+numpy>=1.20.0
+scipy>=1.6.0
+pandas>=1.2.0
+biopython>=1.79
+joblib>=1.0.0
+scikit-learn>=0.24.0
+matplotlib>=3.3.0
+faiss-cpu>=1.7.0  # Or faiss-gpu if GPU support is needed
+numba>=0.53.0
