@@ -11,8 +11,7 @@ vDNAmic is a comprehensive data analysis pipeline for DNA microscopy experiments
 - Integration with genome alignment tools
 
 ## Quick Start
-1. Clone the repository:
-git clone https://github.com/wlab-bio/vdnamic.git
+1. Clone/[download](https://github.com/wlab-bio/vdnamic#:~:text=with%20GitHub%20Desktop-,Download%20ZIP) the repository:
 2. Install dependencies:
 pip install -r requirements.txt
 3. Run the sequence analysis:
