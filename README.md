@@ -21,10 +21,13 @@ python main.py lib /path/to/data//
 python main.py GSE -path /path/to/data//uei_grp0// -inference_dim 3 -inference_eignum 25 -final_eignum 225
 
 ## Sample Data Sets
-For simulated data for GSE (spatial reconstruction) alone, we recommend using one of the simulated data set in the SampleRuns directory
+For simulated data for GSE (spatial reconstruction) alone, we recommend using one of the simulated data set in [the Sample Directory](https://github.com/wlab-bio/vdnamic/tree/main/SAMPLE_DIRECTORY)
+
 For sample end-to-end (sequencer-to-image) analysis, we recommend using a small data set from 
+
 Weinstein, J. A., Regev, A., & Zhang, F. (2019). DNA microscopy: optics-free spatio-genetic imaging by a stand-alone chemical reaction. Cell, 178(1), 229-241.
-Fastq's can most easily be downloaded here: https://uchicago.box.com/s/go4vhae97to7ozu4nwdcq77eah1tlf6x
+
+Fastq's can most easily be downloaded [here](https://uchicago.box.com/s/go4vhae97to7ozu4nwdcq77eah1tlf6x).
 
 ## Documentation
 For detailed usage instructions, parameter explanations, and troubleshooting tips, please refer to the vdnamic_documentation.pdf.
