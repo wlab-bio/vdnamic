@@ -1,6 +1,3 @@
-from Bio import SeqIO
-from Bio import Seq
-import fileOps
 import sysOps
 import os
 import shutil
@@ -266,10 +263,10 @@ class libObj:
         else:
             self.min_reads_per_assoc = 2
             
-        if "-min_reads_per_uei" in self.mySettings:
-            self.min_reads_per_uei = int(self.mySettings["-min_reads_per_uei"][0])
+        if "-min_uei_per_assoc" in self.mySettings:
+            self.min_uei_per_assoc = int(self.mySettings["-min_uei_per_assoc"][0])
         else:  
-            self.min_reads_per_uei = 1
+            self.min_uei_per_assoc = 1
                                                         
         if "-filter_umi0_amp_len" in self.mySettings:
             self.filter_umi0_amp_len = int(self.mySettings["-filter_umi0_amp_len"][0])
@@ -312,6 +309,11 @@ class libObj:
             self.uei_matchfilepath = str(self.mySettings["-uei_matchfilepath"][0])
         else:
             self.uei_matchfilepath = None
+            
+        if "-add_sequences_to_labelfiles" in self.mySettings:
+            self.add_sequences_to_labelfiles = True
+        else:
+            self.add_sequences_to_labelfiles = False
         
     def get_min_allowed_readlens(self):
         
@@ -768,9 +770,9 @@ def subsample(seqform_for_params,seqform_rev_params):
     for this_read_count in subsample_readcounts:
         
         os.mkdir(sysOps.globaldatapath + 'sub' + str(this_read_count))
-        sysOps.sh("sed 's/\.\.\/\//\.\.\/\/\.\.\/\//g' " + sysOps.globaldatapath + 'lib.settings > ' + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings') # replace ..// with ..//..//
-        sysOps.sh("sed -e '/^-STARindexdir /d' -e '/^-gtffile /d' -e '/^-uei_matchfilepath /d' " + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings > ' + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/lib.settings')
-        os.remove(sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings')
+        sysOps.sh(r"sed 's/\(.*\)\.\.\(.*\)\.\./\1\.\.\/\/\.\.\2\.\./' " + sysOps.globaldatapath + 'lib.settings > ' + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings') # replace ..// with ..//..//
+        sysOps.sh("sed -e '/^-uei_matchfilepath /d' " + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings > ' + sysOps.globaldatapath + 'sub' + str(this_read_count) + '/lib.settings') # remove UEI-matching, which will be a poorly-defined problem under sub-sampling
+        #os.remove(sysOps.globaldatapath + 'sub' + str(this_read_count) + '/tmp_lib.settings')
 
         while True:
             this_sub_readcount = np.random.multinomial(this_read_count,np.array(readcounts[:,2])/float(tot_retained_reads))
