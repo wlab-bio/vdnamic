@@ -3,20 +3,21 @@ import sys
 import time
 import os
 import os.path
-import fileOps
 import itertools
 import masterProcesses
 import subprocess
+from joblib import Parallel, delayed
 
 statuslogfilename = 'statuslog.csv'
 globaldatapath = ''
 pipeline_command = ''
+num_workers = -1
 
 def sh(cmd_str):
     #throw_status("RUNNING: " + cmd_str)
     return subprocess.run(cmd_str,shell=True,check=True,stdout=subprocess.PIPE,universal_newlines=True).stdout
 
-def big_sort(param_str,infilename,outfilename,path=None,splitfile_size=500000):
+def big_sort(param_str,infilename,outfilename,path=None,splitfile_size=500000,parallel=False):
     # assumes globaldatapath not pre-appended
     if path is None:
         path = globaldatapath
@@ -25,12 +26,18 @@ def big_sort(param_str,infilename,outfilename,path=None,splitfile_size=500000):
         exitProgram()
     
     throw_status('Beginning sort ' + path + infilename + ' --> ' + path + outfilename + '.')
+    if not os.path.isdir(path + 'tmp'):
+        os.mkdir(path + 'tmp')
     sh("split -l " + str(splitfile_size) + " " + path + infilename + " " + path + "splitfile-")
     [subdirnames, filenames] = get_directory_and_file_list(path)
-    for filename in filenames: 
-        if filename.startswith('splitfile'):
-            sh("sort -T " + path + "tmp " + param_str + " " + path + filename + " > " + path + "sorted_" + filename)
-            os.remove(path + filename)
+    filenames = [filename for filename in filenames if filename.startswith('splitfile')]
+    if parallel:
+        tmpdirs = [path + 'tmp_' + filename + '//' for filename in filenames]
+        sh("mkdir " + " ".join(tmpdirs))
+        Parallel(n_jobs=-1)(delayed(sh)(f"sort -T {tmpdir} {param_str} {path}{filename} > {path}sorted_{filename} && rm {path}{filename} && rm -r {tmpdir}") for filename,tmpdir in zip(filenames,tmpdirs))
+    else:
+        for filename in filenames:
+            sh("sort -T " + path + "tmp " + param_str + " " + path + filename + " > " + path + "sorted_" + filename + " && rm " + path + filename)
         
     sh("sort -T " + path + "tmp -m " + param_str + " " + path + "sorted_splitfile-* > " + path + outfilename)
     sh("rm " + path + "sorted_splitfile-*")
@@ -38,7 +45,7 @@ def big_sort(param_str,infilename,outfilename,path=None,splitfile_size=500000):
     if not check_file_exists(outfilename,path):
         throw_status('Sort failed. Exiting.')
         exitProgram()
-    #throw_status('Completed sort ' + path + infilename + ' --> ' + path + outfilename + '.')
+
     return
     
             

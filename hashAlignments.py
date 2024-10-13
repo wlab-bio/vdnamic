@@ -1,8 +1,35 @@
 import sysOps
 import os
-import alignOps
-import clustOps
 import subprocess
+from joblib import Parallel, delayed
+
+def parallel_mismatch_alignment(i,uxi_file,identical_uxi_file,num_uxi_seq,path):
+
+    tmp_path = path + "tmp_mis" + str(i+1) + "//"
+    os.mkdir(tmp_path)
+    sysOps.sh("sed 's/.//" + str(i+1) + "' " + path + identical_uxi_file + " > " + tmp_path + "mis" + str(i+1) + "_" + identical_uxi_file)
+    # remove (i+1)th character of uxi sequences (comprising 1st column of identical_uxi_file)
+    
+    sysOps.big_sort(" -k1,1 -k3n,3 -t \",\" ","mis" + str(i+1) + "_" + identical_uxi_file , "mis" + str(i+1) + "_sorted_indexed_" + uxi_file,path=tmp_path,parallel=True)
+    # mis*_sorted_indexed_* contains lines sorted first by sequence and then by INCREASING read counts
+    os.remove(tmp_path + "mis" + str(i+1) + "_" + identical_uxi_file)
+
+    # output columns: i*num_uxi_seq + eq_grp , seq_index , cumul_reads (does NOT include current line) , num_reads
+    # will output only if eq_grp has more than 1 member
+    sysOps.sh("awk -F, 'BEGIN{cumul_reads=0;prev_seq=\"-1\";prev_prev_seq=\"-2\";eq_grp=-1;}"
+              + "{if(prev_seq==$1){"
+              + "print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;"
+              + "cumul_reads+=$3;}"
+              + "else{"
+              + "if(prev_seq==prev_prev_seq){print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;}"
+              + "eq_grp++;cumul_reads=0;}"
+              + "prev_prev_seq=prev_seq; prev_seq = $1;prev_col2=$2;prev_col3=$3;}"
+              + "END{if(prev_seq==prev_prev_seq){print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;}}' "
+              + tmp_path + "mis" + str(i+1) + "_sorted_indexed_" + uxi_file + " > "
+              + tmp_path + "allmis_" + uxi_file)
+    os.remove(tmp_path + "mis" + str(i+1) + "_sorted_indexed_" + uxi_file)
+    
+    return tmp_path
 
 def initiate_hash_alignment(uxi_file,base_count_filterval=None):
     '''
@@ -36,7 +63,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
         sysOps.throw_status('Uniformity check complete.')
         non_uxi_len = int(maxchar_pre_uxi)
         
-        sysOps.big_sort(" -k4,4 -t \",\" ",uxi_file,"sorted_indexed_" + uxi_file)
+        sysOps.big_sort(" -k4,4 -t \",\" ",uxi_file,"sorted_indexed_" + uxi_file,parallel=True)
         # sorted_indexed_* now has columns
         # 1. 0-padded line/read-number (from filtered_src_data.txt)
         # 2. 0-padded read1 seqform
@@ -77,29 +104,9 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
     num_uxi_seq = int(sysOps.sh('wc -l < ' + sysOps.globaldatapath + identical_uxi_file).strip('\n'))
     
     if not sysOps.check_file_exists("seq_sort_" + uxi_file):
-        for i in range(uxi_len):    
-            sysOps.sh("sed 's/.//" + str(i+1) + "' " + sysOps.globaldatapath + identical_uxi_file + " > " + sysOps.globaldatapath + "mis" + str(i+1) + "_" + identical_uxi_file)
-            # remove (i+1)th character of uxi sequences (comprising 1st column of identical_uxi_file)
-            
-            sysOps.big_sort(" -k1,1 -k3n,3 -t \",\" ","mis" + str(i+1) + "_" + identical_uxi_file , "mis" + str(i+1) + "_sorted_indexed_" + uxi_file)        
-            # mis*_sorted_indexed_* contains lines sorted first by sequence and then by INCREASING read counts
-            os.remove(sysOps.globaldatapath + "mis" + str(i+1) + "_" + identical_uxi_file)
-    
-            # output columns: i*num_uxi_seq + eq_grp , seq_index , cumul_reads (does NOT include current line) , num_reads
-            # will output only if eq_grp has more than 1 member
-            sysOps.sh("awk -F, 'BEGIN{cumul_reads=0;prev_seq=\"-1\";prev_prev_seq=\"-2\";eq_grp=-1;}"
-                      + "{if(prev_seq==$1){"
-                      + "print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;"
-                      + "cumul_reads+=$3;}"
-                      + "else{"
-                      + "if(prev_seq==prev_prev_seq){print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;}"
-                      + "eq_grp++;cumul_reads=0;}"
-                      + "prev_prev_seq=prev_seq; prev_seq = $1;prev_col2=$2;prev_col3=$3;}"
-                      + "END{if(prev_seq==prev_prev_seq){print " + str(i*num_uxi_seq) + "+eq_grp \",\" prev_col2 \",\" cumul_reads \",\" prev_col3;}}' "
-                      + sysOps.globaldatapath + "mis" + str(i+1) + "_sorted_indexed_" + uxi_file + " >> "
-                      + sysOps.globaldatapath + "allmis_" + uxi_file)
-            os.remove(sysOps.globaldatapath + "mis" + str(i+1) + "_sorted_indexed_" + uxi_file)
-        
+        Parallel(n_jobs=-1)(delayed(parallel_mismatch_alignment)(i,uxi_file,identical_uxi_file, num_uxi_seq, sysOps.globaldatapath) for i in range(uxi_len))
+        sysOps.sh("cat " + sysOps.globaldatapath + "tmp_mis*//allmis_" + uxi_file + " > " + sysOps.globaldatapath + "allmis_" + uxi_file)
+        sysOps.sh("rm -r " + sysOps.globaldatapath + "tmp_mis*")
         nonempty_eqgrp_lines = int(sysOps.sh('wc -l < ' + sysOps.globaldatapath + "allmis_" + uxi_file).strip('\n'))
         
         if nonempty_eqgrp_lines==0:
@@ -107,7 +114,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
         else:
             # calculate RNDs
             # Sort by seq_index (lexicographic), sum all cumulative reads (and self-reads) to calculate RND
-            sysOps.big_sort(" -k2,2 -t \",\" ","allmis_" + uxi_file,"seq_sorted_allmis_" + uxi_file)
+            sysOps.big_sort(" -k2,2 -t \",\" ","allmis_" + uxi_file,"seq_sorted_allmis_" + uxi_file,parallel=True)
             os.remove(sysOps.globaldatapath + "allmis_" + uxi_file)
             
             # in below loop, count self reads ($4) only when *beginning* with current seq_index
@@ -129,7 +136,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
             # output columns: eq_grp (i*num_uxi_seq + eq_grp), seq_index, rnd (will be seq rnd), rnd (will be clust rnd), preliminary clustering index (initiated as unique sequence-index)
             
             # CHECK IF NECESSARY
-            sysOps.big_sort(" -k2n,2 -k4rn,4 -k1,1 -t \",\" ","tmp_seq_link_" + uxi_file,"seq_sort_" + uxi_file)
+            sysOps.big_sort(" -k2n,2 -k4rn,4 -k1,1 -t \",\" ","tmp_seq_link_" + uxi_file,"seq_sort_" + uxi_file,parallel=True)
             # output columns: eq_grp, seq_index (sorted NUMERICALLY), rnd, rnd, preliminary clustering index (initiated as unique sequence-index)
             # 3rd argument (-k1,1) is only a tie-breaker, to be made consistent with the below tmp_eqgrp_sort_edits_* sort
             
@@ -148,7 +155,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
             sysOps.throw_status("Beginning loop-iteration " + str(iter) + " for clustering of " + sysOps.globaldatapath + uxi_file)
             # Re-sort by eq_grp as 1st key, RND as 2nd (descending)
             if iter == 1:
-                sysOps.big_sort(" -k1,1 -k3rn,3 -k2n,2 -t \",\" ","seq_sort_" + uxi_file,"eqgrp_sort_" + uxi_file)
+                sysOps.big_sort(" -k1,1 -k3rn,3 -k2n,2 -t \",\" ","seq_sort_" + uxi_file,"eqgrp_sort_" + uxi_file,parallel=True)
                 # 3rd argument (-k2n,2) is only a tie-breaker, to be made consistent with the below tmp_seq_sort_edits_* sort
                 # eq_grp (i*num_uxi_seq + eq_grp), seq_index, seq rnd, clust rnd, preliminary clustering index (initiated as unique sequence-index)
             
@@ -185,7 +192,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
                 break
             
             # NOTE: CLUSTER INDEX AND MAX_RND MUST BE LOCKED TOGETHER THROUGHOUT LOOP
-            sysOps.big_sort(" -k2n,2 -k4rn,4 -k1,1 -t \",\" ","tmp_eqgrp_sort_edits_" + uxi_file,"eqgrp_sort_edits_" + uxi_file)
+            sysOps.big_sort(" -k2n,2 -k4rn,4 -k1,1 -t \",\" ","tmp_eqgrp_sort_edits_" + uxi_file,"eqgrp_sort_edits_" + uxi_file,parallel=True)
             # sort parameters must be precisely the same as for seq_sort_* before loop
             
             # print only one edit (the top clust rnd) per unique sequence
@@ -217,7 +224,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
             os.remove(sysOps.globaldatapath + "seq_sort_" + uxi_file)
             os.rename(sysOps.globaldatapath + "tmp_seq_sort_" + uxi_file,sysOps.globaldatapath + "seq_sort_" + uxi_file)
             if sysOps.check_file_exists("tmp_seq_sort_edits_" + uxi_file):
-                sysOps.big_sort(" -k1,1 -k3rn,3 -k2n,2 -t \",\" ","tmp_seq_sort_edits_" + uxi_file,"seq_sort_edits_" + uxi_file)
+                sysOps.big_sort(" -k1,1 -k3rn,3 -k2n,2 -t \",\" ","tmp_seq_sort_edits_" + uxi_file,"seq_sort_edits_" + uxi_file,parallel=True)
             else:
                 with open(sysOps.globaldatapath + "seq_sort_edits_" + uxi_file,'w') as tmpfile:
                     tmpfile.write('-1,-1') # no edits to make
@@ -243,7 +250,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
     
     os.remove(sysOps.globaldatapath + "seq_sort_" + uxi_file)
     
-    sysOps.big_sort(" -k1,1 -t \",\" ","tmp_seq_sort_clust_" + uxi_file,"seq_sort_clust_" + uxi_file)
+    sysOps.big_sort(" -k1,1 -t \",\" ","tmp_seq_sort_clust_" + uxi_file,"seq_sort_clust_" + uxi_file,parallel=True)
     # output columns: seq_index (sorted LEXICOGRAPHICALLY), cluster_ind
     os.remove(sysOps.globaldatapath + "tmp_seq_sort_clust_" + uxi_file)
     
@@ -286,7 +293,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
     #os.remove(sysOps.globaldatapath + "max_base_use_" + uxi_file)
     
     # NOTE: it is possible that the following sort is unnecessary if seq-index numbering conforms to sequence-ordering
-    sysOps.big_sort(" -k2,2 -t \",\" ","line_seq_index_" + uxi_file,"sorted_line_seq_index_" + uxi_file)
+    sysOps.big_sort(" -k2,2 -t \",\" ","line_seq_index_" + uxi_file,"sorted_line_seq_index_" + uxi_file,parallel=True)
     # sorted_line_seq_index_ columns:
     # 1. source line number
     # 2. unique-sequence-index (sorted LEXICOGRAPHICALLY)
@@ -320,7 +327,7 @@ def initiate_hash_alignment(uxi_file,base_count_filterval=None):
     
     sysOps.throw_status('Performing final line-sort of data from ' + sysOps.globaldatapath + uxi_file)
 
-    sysOps.big_sort(" -k1,1 -t \",\" ","line_clust_index_" + uxi_file,"line_sorted_clust_" + uxi_file)
+    sysOps.big_sort(" -k1,1 -t \",\" ","line_clust_index_" + uxi_file,"line_sorted_clust_" + uxi_file,parallel=True)
     os.remove(sysOps.globaldatapath + "line_clust_index_" + uxi_file)
     # line_sorted_clust_* has columns
     # 1. source file line (ascending order, LEXICOGRAPHICALLY)

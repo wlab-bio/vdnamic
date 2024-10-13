@@ -1,15 +1,12 @@
 import os
 import libOps
 import sysOps
-import alignOps
 import dnamicOps
 import hashAlignments
 import time
-import matOps
 import optimOps
 import itertools
 import numpy as np
-from Bio import SeqIO
 
 class masterProcess:
     def __init__(self):
@@ -36,11 +33,10 @@ class masterProcess:
             sysOps.sh('gzip ' + sysOps.globaldatapath + 'rejected.txt')
         
         if not sysOps.check_file_exists('ncrit.txt'):
-            self.generate_cluster_analysis(myLibObj.min_reads_per_assoc,myLibObj.min_uei_per_umi,myLibObj.min_reads_per_uei,myLibObj.uei_classification)
+            self.generate_cluster_analysis(myLibObj.min_reads_per_assoc,myLibObj.min_uei_per_umi,myLibObj.min_uei_per_assoc,myLibObj.uei_classification)
             
         # umi index, amplicon sequence
-        dnamicOps.get_amp_consensus(myLibObj.seq_terminate_list,myLibObj.filter_umi0_amp_len,myLibObj.filter_umi1_amp_len,myLibObj.filter_umi0_quickmatch,myLibObj.filter_umi1_quickmatch,myLibObj.STARindexdir,myLibObj.gtffile,myLibObj.uei_matchfilepath)
-        
+        dnamicOps.get_amp_consensus(myLibObj.seq_terminate_list,myLibObj.filter_umi0_amp_len,myLibObj.filter_umi1_amp_len,myLibObj.filter_umi0_quickmatch,myLibObj.filter_umi1_quickmatch,myLibObj.STARindexdir,myLibObj.gtffile,myLibObj.uei_matchfilepath,myLibObj.add_sequences_to_labelfiles)
 
         libOps.subsample(myLibObj.seqform_for_params,myLibObj.seqform_rev_params)
 
@@ -52,7 +48,7 @@ class masterProcess:
             sysOps.initiate_runpath(path + dirname + '//')
             myLibObj = libOps.libObj(settingsfilename = 'lib.settings')
             myLibObj.stack_uxis()
-            self.generate_cluster_analysis(myLibObj.min_reads_per_assoc,myLibObj.min_uei_per_umi,myLibObj.min_reads_per_uei,myLibObj.uei_classification)
+            self.generate_cluster_analysis(myLibObj.min_reads_per_assoc,myLibObj.min_uei_per_umi,myLibObj.min_uei_per_assoc,myLibObj.uei_classification)
             
             dnamicOps.get_amp_consensus(myLibObj.seq_terminate_list,myLibObj.filter_umi0_amp_len,myLibObj.filter_umi1_amp_len,myLibObj.filter_umi0_quickmatch,myLibObj.filter_umi1_quickmatch,myLibObj.STARindexdir,myLibObj.gtffile)
     
@@ -61,10 +57,7 @@ class masterProcess:
         return
         
     def dnamic_inference(self,path):
-        # Perform image inference on the basis of raw output of DNA microscopy sequence analysis
-                        
         original_datapath = str(sysOps.globaldatapath)
-                            
         sysOps.initiate_runpath(path)
         
         # Basic settings
@@ -89,7 +82,7 @@ class masterProcess:
         
         return 
         
-    def generate_cluster_analysis(self,min_reads_per_assoc, min_uei_per_umi, min_reads_per_uei, uei_classification = None):
+    def generate_cluster_analysis(self,min_reads_per_assoc, min_uei_per_umi, min_uei_per_assoc, uei_classification = None):
         # Perform clustering analysis of UMI and UEI sequences, consolidate pairings and determine consenses of these pairings
         
         # ensure all cluster files are removed from directory (in case previously initiated)
@@ -131,7 +124,7 @@ class masterProcess:
                         
         if uxi_ind > 2:
             sysOps.throw_status('Outputting inference files.')
-            dnamicOps.output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_reads_per_uei, uei_classification)
+            dnamicOps.output_inference_inp_files(min_reads_per_assoc, min_uei_per_umi, min_uei_per_assoc, uei_classification)
         else:
             # UMIs only, no UEIs
             for my_uxi_ind in range(uxi_ind):
