@@ -18,7 +18,7 @@ pip install -r requirements.txt
 3. Run the sequence analysis:
 python main.py lib /path/to/data//
 4. Perform spatial reconstruction:
-python main.py GSE -path /path/to/data//uei_grp0// -inference_dim 3 -inference_eignum 25 -final_eignum 225
+python main.py GSE -path /path/to/data//uei_grp0// -inference_dim [INT] -inference_eignum [INT] -final_eignum [INT]
 
 ## Sample Data Sets
 For simulated data for GSE (spatial reconstruction) alone, we recommend using one of the simulated data set in [the Sample Directory](https://github.com/wlab-bio/vdnamic/tree/main/SAMPLE_DIRECTORY)
