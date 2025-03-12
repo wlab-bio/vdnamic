@@ -1,12 +1,12 @@
 -source_for R1_uei.fastq
 -source_rev R2_uei.fastq
--seqform_rev U_GCTNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNTGA_2:39
 -seqform_for U_NWNNNNWWSWNNNWSWNNNWSWWNNNWNGCG_0:31|U_AGGNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNAGC_39:76
 -seqform_for U_WNNNNWNSWNWNWNWSNNNSWNNWWWNNATG_0:31|U_AGGNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNAGC_41:78
+-seqform_rev U_GCTNWWNNNNWWSWNNNWSWNNNWSWWNNNNWWNTGA_2:39
 -min_mean_qual 30
 -filter_umi0_amp_len 25
 -min_uei_per_umi 2
--min_reads_per_assoc 2
+-min_uei_per_assoc 2
 -min_assoc_per_umi 1
 -u0 *,*,1
 -u1 *,*,2
