@@ -1029,7 +1029,7 @@ def proj_cg(partitioned_linop, bvec, l2reg, tol=1e-6, MAX_ITER=1000):
     """
     
     # Initial non-regularized solution using standard CG
-    x, exit_code = scipy.sparse.linalg.cg(partitioned_linop, bvec, tol=tol, maxiter=MAX_ITER)
+    x, exit_code = scipy.sparse.linalg.cg(partitioned_linop, bvec, atol=tol, maxiter=MAX_ITER)
     # Apply initial L2 regularization to the solution
     x *= np.sqrt(l2reg) / (1E-10 + LA.norm(x))
     
