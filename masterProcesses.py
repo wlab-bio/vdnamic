@@ -36,8 +36,17 @@ class masterProcess:
             self.generate_cluster_analysis(myLibObj.min_reads_per_assoc,myLibObj.min_uei_per_umi,myLibObj.min_uei_per_assoc,myLibObj.uei_classification)
             
         # umi index, amplicon sequence
-        dnamicOps.get_amp_consensus(myLibObj.seq_terminate_list,myLibObj.filter_umi0_amp_len,myLibObj.filter_umi1_amp_len,myLibObj.filter_umi0_quickmatch,myLibObj.filter_umi1_quickmatch,myLibObj.STARindexdir,myLibObj.gtffile,myLibObj.uei_matchfilepath,myLibObj.add_sequences_to_labelfiles)
-
+        dnamicOps.get_amp_consensus(
+            myLibObj.seq_terminate_list,
+            myLibObj.filter_umi0_amp_len,
+            myLibObj.filter_umi1_amp_len,
+            myLibObj.filter_umi0_quickmatch,
+            myLibObj.filter_umi1_quickmatch,
+            myLibObj.STARindexdir,
+            myLibObj.gtffile,
+            myLibObj.uei_matchfilepath,
+            myLibObj.add_sequences_to_labelfiles
+        )
         libOps.subsample(myLibObj.seqform_for_params,myLibObj.seqform_rev_params)
 
         [subdirnames, filenames] = sysOps.get_directory_and_file_list()

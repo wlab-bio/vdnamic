@@ -1,5 +1,3 @@
-from Bio import SeqIO
-from Bio import Seq
 import numpy as np
 import sysOps
 import itertools
@@ -439,7 +437,49 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 # 8. transcript name/s
                 # 9. number of reads
                 # 10. cDNA UMI index *or* query sequence if add_sequences_to_labelfiles = TRUE
-                
+            
+            elif (uei_matchfilepath is not None):
+                # 1) Build clust→(umi seq, uniq-seq index) table if missing
+                if not sysOps.check_file_exists("clust_sort_clust_uxi" + str(amp_ind) + ".txt"):
+                    sysOps.big_sort(" -k2,2 -t \",\" ",
+                                    "max_base_use_uxi" + str(amp_ind) + ".txt",
+                                    "seqindex_sorted_uxi" + str(amp_ind) + ".txt")
+                    # seqindex_sorted_uxi: (umi_seq, uniq_seq_index, max_base_frac)
+                    # join with seq_sort_clust_uxi: (uniq_seq_index, cluster_ind)
+                    sysOps.sh("join -t \",\" -1 2 -2 1 -o1.1,1.2,2.2 "
+                                + sysOps.globaldatapath + "seqindex_sorted_uxi" + str(amp_ind) + ".txt "
+                                + sysOps.globaldatapath + "seq_sort_clust_uxi" + str(amp_ind) + ".txt > "
+                                + sysOps.globaldatapath + "tmp_seq_sort_clust_uxi" + str(amp_ind) + ".txt")
+                    sysOps.big_sort(" -k3,3 -t \",\" ",
+                                    "tmp_seq_sort_clust_uxi" + str(amp_ind) + ".txt",
+                                    "clust_sort_clust_uxi" + str(amp_ind) + ".txt")
+                # 2) Fabricate umi_assignments (STAR-less) from amplicon consensus tallies
+                #    Format must be: cluster_ind,start,mut,contig,gene_id,biotype,transcript,Nreads,query_name
+                sysOps.sh("awk -F, '{print $1 \",-1,None,NA,NA,NA,NA,\" $2 \",\" $1;}' "
+                            + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "
+                            + sysOps.globaldatapath + "umi_assignments" + str(amp_ind) + ".txt")
+                # 3) Join to produce umi_seq_assignments (same schema as STAR path)
+                sysOps.sh("join -t \",\" -1 3 -2 1 -o1.1,1.2,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.1 " \
+                            + sysOps.globaldatapath + "clust_sort_clust_uxi" + str(amp_ind) + ".txt " \
+                            + sysOps.globaldatapath + "umi_assignments" + str(amp_ind) + ".txt > " \
+                            + sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt")
+                # 4) If requested, also attach raw consensus sequences to the last column
+                if add_sequences_to_labelfiles:
+                    os.rename(sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt",
+                                sysOps.globaldatapath + "tmp_umi_seq_assignments" + str(amp_ind) + ".txt")
+                    sysOps.big_sort(" -k10,10 -t \",\" ", "tmp_umi_seq_assignments" + str(amp_ind) + ".txt",
+                                    "tmp_sorted_umi_seq_assignments" + str(amp_ind) + ".txt")
+                    sysOps.big_sort(" -k1,1 -t \",\" ", "amp" + str(amp_ind) + "_seqcons_trimmed.txt",
+                                    "tmp_sorted_amp" + str(amp_ind) + "_seqcons_trimmed.txt")
+                    sysOps.sh("join -t \",\" -1 10 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.3 " \
+                                + sysOps.globaldatapath + "tmp_sorted_umi_seq_assignments" + str(amp_ind) + ".txt " \
+                                + sysOps.globaldatapath + "tmp_sorted_amp" + str(amp_ind) + "_seqcons_trimmed.txt > " \
+                                + sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt")
+                # 5) Final sort to materialize sorted_umi_seq_assignments*.txt
+                sysOps.big_sort(" -k1,1 -t \",\" ",
+                                "umi_seq_assignments" + str(amp_ind) + ".txt",
+                                "sorted_umi_seq_assignments" + str(amp_ind) + ".txt")
+
             else:
                 sysOps.throw_status('No genome directory provided, skipping alignment.')
                 
@@ -472,6 +512,7 @@ def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len
                 
                 # allowing mismatch
                 num_chars = len(sysOps.sh("tail -1 " +  sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt").split(',')[0])
+                sysOps.throw_status("Allowing mismatch across num_chars = " + str(num_chars))
                 for i in range(num_chars):
                     sysOps.sh("sed 's/.//" + str(i+1) + "' " + sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "mis" + str(i+1) + "_UEIdata_uxi" +str(amp_ind) + ".txt")
                     sysOps.sh("sed 's/.//" + str(i+1) + "' " + sysOps.globaldatapath + "sorted_umi_seq_assignments" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "mis" + str(i+1) + "_sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
