@@ -46,13 +46,13 @@ For sample end-to-end (sequencer-to-image) analysis, we recommend using a small 
 Weinstein, J. A., Regev, A., & Zhang, F. (2019). DNA microscopy: optics-free spatio-genetic imaging by a stand-alone chemical reaction. Cell, 178(1), 229-241. 
 Fastq's can most easily be downloaded [here](https://uchicago.box.com/s/go4vhae97to7ozu4nwdcq77eah1tlf6x).
 ## Documentation
-See the [PDF manual](./vdnamic_documentation.pdf) **and** the hands-on Jupyter tutorial in `docs/notebooks/`.
+See the [PDF manual](./vdnamic_documentation.pdf) .
 
 Key runtime tools:
 
 * STAR ≥ 2.7.9a &nbsp;•&nbsp; samtools ≥ 1.18  
 * gawk / bioawk (FASTQ preprocessing)  
-* Optional CUDA 11+ for FAISS-GPU acceleration
+
 ## Citation
 If you use vDNAmic in your research, please cite:
 Qian, N., Weinstein, J.A. Spatial transcriptomic imaging of an intact organism using volumetric DNA microscopy. Nat Biotechnol (2025). https://doi.org/10.1038/s41587-025-02613-z
