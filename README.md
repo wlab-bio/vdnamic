@@ -16,20 +16,9 @@ git clone https://github.com/wlab-bio/vdnamic.git
 cd vdnamic
 ```
 
-## 2 · Install dependencies
-
-**a. Standard pip install**  
+## 2 · Standard pip install
 ```bash
 python -m pip install -r requirements.txt
-```
-
-<details>
-<summary>Need a fully reproducible, one-command setup?</summary>
-
-**b. Conda / mamba (avoids compiling FAISS, STAR, etc.)**  
-```bash
-mamba env create -f environment.yml   # or: conda env create …
-conda activate vdnamic
 ```
 
 </details>
