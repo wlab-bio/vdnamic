@@ -47,8 +47,7 @@ Weinstein, J. A., Regev, A., & Zhang, F. (2019). DNA microscopy: optics-free spa
 Fastq's can most easily be downloaded [here](https://uchicago.box.com/s/go4vhae97to7ozu4nwdcq77eah1tlf6x).
 ## Documentation
 See the [PDF manual](./vdnamic_documentation.pdf) **and** the hands-on Jupyter tutorial in `docs/notebooks/`.
-## Requirements
-All dependencies—Python *and* external binaries—are pinned in **`environment.yml`**.  
+
 Key runtime tools:
 
 * STAR ≥ 2.7.9a &nbsp;•&nbsp; samtools ≥ 1.18  
