@@ -105,10 +105,10 @@ python main.py lib /path/to/analysis//
 ```
 
 5. **Run spatial reconstruction (GSE)**
-   `-calc_final` writes final, re-indexed outputs to the given path.
+   `-calc_final` location to search for label_pt0.txt and label_pt1.txt for annotation of coordinates in final_labels.txt
 
 ```bash
-python main.py GSE -path /path/to/analysis// -inference_dim 2 -calc_final ./out/
+python main.py GSE -path /path/to/analysis// -inference_dim 2 -calc_final /path/to/labels
 ```
 
 6. **Visualize**
@@ -195,7 +195,7 @@ python main.py GSE \
   -sub_size 15000 \
   -ncpus 10 \
   -filter_criterion 5 \
-  -calc_final ./out/
+  -calc_final ../path/to/labels
 ```
 
 **Common flags**
@@ -204,7 +204,7 @@ python main.py GSE \
 * `-sub_num`, `-sub_size` — number/size of subsamples
 * `-ncpus` — CPU cores to use
 * `-filter_criterion` — percentile for dropping low-connectivity nodes
-* `-calc_final PATH` — writes `final_coords.txt`, `final_labels.txt`, etc.
+* `-calc_final PATH` — location to search for label_pt0.txt and label_pt1.txt for annotation of coordinates in final_labels.txt
 
 > **Tip:** For very large graphs, increase `-sub_size`, reduce `-sub_num`, and consider a modest `-filter_criterion`.
 
@@ -236,7 +236,6 @@ python vdnamic_fastq_sim_patched.py \
 
 ## Troubleshooting
 
-* **“Unrecognized pipeline input”** — Check command format and ensure working directories end with `//`.
 * **Too many reads failing quality** — Lower `-min_mean_qual`.
 * **Low-complexity UMI over-pruning** — Adjust the filter if valid UMIs are dropped.
 * **Memory issues on large graphs** — Reduce `-final_eignum`, tune `-sub_num`/`-sub_size`, or use more RAM.
