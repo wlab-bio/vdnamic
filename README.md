@@ -60,6 +60,32 @@ joblib>=1.0.0
 matplotlib>=3.4.0
 ```
 
+### Conda or Docker environments
+
+Use these options for conda/docker setup. (The default remains **pip-first** via `requirements.txt` if you prefer.)
+
+#### Conda (local)
+
+```bash
+# Create and activate the Conda environment
+conda env create -f environment.yml
+conda activate project
+```
+
+> Tip: if/when you add a `setup.py` or `pyproject.toml`, you can install your package in editable mode with:
+> `pip install -e .` inside the env.
+
+#### Docker (CPU-only)
+
+```bash
+# Build the image from the provided Dockerfile
+docker build -t vdnamic:cpu .
+
+# Optional: quick import check
+docker run --rm -it vdnamic:cpu \
+  python -c "import numpy, sklearn, faiss, annoy, pymetis, Bio; print('ok')"
+```
+
 ### Recommended hardware
 
 * 4+ CPU cores
