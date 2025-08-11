@@ -26,8 +26,3 @@ dependencies:
 
   # Visualisation (used in docs/examples)
   - matplotlib>=3.4.0
-
-  # Optional: install your repo in editable mode if it has setup.py
-  # or if you later add pyproject.toml. Leave commented if not needed.
-  # - pip:
-  #     - -e .
