@@ -23,11 +23,6 @@ ENV PATH=/opt/conda/envs/project/bin:${PATH}
 # Now copy the rest of the repository
 COPY . /opt/app
 
-# OPTIONAL: if you later add setup.py/pyproject.toml and want editable install, uncomment:
-# RUN if [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then \
-#         python -m pip install --no-cache-dir -e . ; \
-#     fi
-
 # NOTE: We intentionally do NOT pip install requirements.txt here, since the
 # environment is defined in environment.yml. This avoids mixing pip/conda for the
 # same packages (e.g., faiss-cpu) which can cause conflicts. If you still want to
