@@ -217,7 +217,7 @@ python main.py GSE \
   -sub_num 30 \
   -sub_size 15000 \
   -ncpus 10 \
-  -filter_criterion 5 \
+  -filter_criterion 1 \
   -calc_final ../path/to/labels
 ```
 
@@ -226,7 +226,7 @@ python main.py GSE \
 * `-inference_dim` — embedding dimension (2 or 3)
 * `-sub_num`, `-sub_size` — number/size of subsamples
 * `-ncpus` — CPU cores to use
-* `-filter_criterion` — percentile for dropping low-connectivity nodes
+* `-filter_criterion` — percentile for dropping high UEI-dispersion nodes
 * `-calc_final PATH` — location to search for label_pt0.txt and label_pt1.txt for annotation of coordinates in final_labels.txt
 
 > **Tip:** For very large graphs, increase `-sub_size`, reduce `-sub_num`, and consider a modest `-filter_criterion`.
