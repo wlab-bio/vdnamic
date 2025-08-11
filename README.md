@@ -72,9 +72,6 @@ conda env create -f environment.yml
 conda activate project
 ```
 
-> Tip: if/when you add a `setup.py` or `pyproject.toml`, you can install your package in editable mode with:
-> `pip install -e .` inside the env.
-
 #### Docker (CPU-only)
 
 ```bash
