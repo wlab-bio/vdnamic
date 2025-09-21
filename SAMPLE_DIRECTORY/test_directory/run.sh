@@ -11,14 +11,15 @@ python vdnamic_fastq_sim_patched.py \
   --dropout0 0.0 \
   --dropout1 0.0 \
   --encode-digits ACGT \
-  --encode-width 10 \
+  --encode-width 50 \
   --cdna-settings cdna.lib.settings \
   --uei-settings uei.lib.settings \
   --avg-reads-uei 4.5 \
   --min-reads-uei 1 \
-  --avg-reads-cdna 3.0 \
+  --avg-reads-cdna 3 \
   --min-reads-cdna 1 \
   --use-uei-weights \
+  --cdna-sample-file "/Users/ymr/Desktop/star_dir/cDNA_fragments_50bp.txt" \
   -o sim_fastq \
 
 ECHO "Completed random sequence-generator"

@@ -737,7 +737,7 @@ def encode_indices_base4_vectorized(indices: np.ndarray, width: int = 0, digits:
     """Vectorized base-4 encoding for multiple indices."""
     if len(indices) == 0:
         return []
-    
+
     indices = np.asarray(indices, dtype=np.int64)
     if width == 0:
         max_val = np.max(indices)
@@ -751,7 +751,6 @@ def encode_indices_base4_vectorized(indices: np.ndarray, width: int = 0, digits:
     for i in range(width):
         result[:, width - 1 - i] = digit_arr[temp % 4]
         temp //= 4
-    
     return [''.join(row) for row in result]
 
 def _pairwise_d2(pos0: np.ndarray, pos1: np.ndarray) -> np.ndarray:
@@ -774,6 +773,7 @@ def build_inputs_from_positions(pos_csv: str,
                                 dropout1: float,
                                 encode_width: int | None,
                                 encode_digits: str,
+                                cdna_sample_file: str | None,
                                 seed: int | None = None) -> tuple[Path, Path, Path, int, int]:
     """Build umi0.txt, umi1.txt, and graph.npz from positions CSV."""
     from scipy.sparse import csr_matrix, save_npz
@@ -851,15 +851,30 @@ def build_inputs_from_positions(pos_csv: str,
     graph_path = outdir / 'graph.npz'
     save_npz(graph_path, graph)
 
-    # Use vectorized encoding when possible
-    def _make_inserts(n: int, dropout: float, values: np.ndarray | None = None) -> list[str]:
-        dropout_mask = np.random.rand(n) < dropout
-        indices = np.asarray(values, dtype=np.int64) if values is not None else np.arange(n, dtype=np.int64)
-        # Vectorized even when width==0 (the helper computes minimal width)
-        encoded = encode_indices_base4_vectorized(indices, width=encode_width or 0, digits=encode_digits)
-        seqs = ['N' if dropout_mask[i] else encoded[i] for i in range(n)]
 
-        return seqs
+    def _make_inserts(n: int, dropout: float, values: np.ndarray | None = None) -> list[str]:
+        if cdna_sample_file is None:
+            # Use vectorized encoding when possible
+            dropout_mask = np.random.rand(n) < dropout
+            indices = np.asarray(values, dtype=np.int64) if values is not None else np.arange(n, dtype=np.int64)
+            # Vectorized even when width==0 (the helper computes minimal width)
+            encoded = encode_indices_base4_vectorized(indices, width=encode_width or 0, digits=encode_digits)
+            seqs = ['N' if dropout_mask[i] else encoded[i] for i in range(n)]
+            return seqs
+        else:
+            with open(cdna_sample_file, "r") as cDNA_pool_file:
+                pool = cDNA_pool_file.read().splitlines()
+            seqs = []
+            dropout_mask = np.random.rand(n) < dropout
+            for i in range(n):
+                if dropout_mask[i]:
+                    seqs.append('N')
+                else:
+                    import random
+                    sampled_inserts = random.sample(pool, random.randint(1, 3)) 
+                    sampled_inserts = [insert[:encode_width] for insert in sampled_inserts]
+                    seqs.append(';'.join(sampled_inserts))
+            return seqs
 
     # Map back to ORIGINAL CSV row indices for each partition
     sorted_rows = order  # maps sorted position -> original CSV row
@@ -919,7 +934,7 @@ def process_umi_batch(batch_args: tuple) -> list:
     (start_idx, end_idx, ins_list, umi_list, label, L,
      cdna_cfg, avg_reads, min_reads, read_len_for, read_len_rev,
      batch_seed) = batch_args
-
+    
     if batch_seed is not None:
         random.seed(batch_seed)
         np.random.seed(batch_seed)    
@@ -954,7 +969,6 @@ def process_umi_batch(batch_args: tuple) -> list:
         chosen_pairs[idx] = _choose_seqform_pair_with_labels(
             cdna_cfg, require_labels={label}
         )
-    
     for idx in range(start_idx, end_idx):
         if ins_list[idx] == 'N':
             continue
@@ -967,30 +981,33 @@ def process_umi_batch(batch_args: tuple) -> list:
 
         # Build the read ONCE per UMI and reuse it for all that UMI's reads
         umi_map = {(label, L): umi_list[idx]}
-        r1_cd_const = build_read_optimized(
-            r1_cd_sfs, read_len_for,
-            amplicon=ins_list[idx],
-            terminators=cdna_cfg['amplicon_terminate'],
-            umi_map=umi_map, umi_pool_dict={},
-            u_label_by_ord=cd_r1_map, revcomp_by_ord=cd_r1_rev,
-            read_tag='f', builder=builder
-        )
-        r2_cd_const = build_read_optimized(
-            r2_cd_sfs, read_len_rev,
-            amplicon=ins_list[idx],
-            terminators=cdna_cfg['amplicon_terminate'],
-            umi_map=umi_map, umi_pool_dict={},
-            u_label_by_ord=cd_r2_map, revcomp_by_ord=cd_r2_rev,
-            read_tag='r', builder=builder
-        )
+        
+        for cDNA_insert in ins_list[idx].split(';'):
+            r1_cd_const = build_read_optimized(
+                r1_cd_sfs, read_len_for,
+                amplicon=cDNA_insert,
+                terminators=cdna_cfg['amplicon_terminate'],
+                umi_map=umi_map, umi_pool_dict={},
+                u_label_by_ord=cd_r1_map, revcomp_by_ord=cd_r1_rev,
+                read_tag='f', builder=builder
+            )
+            r2_cd_const = build_read_optimized(
+                r2_cd_sfs, read_len_rev,
+                amplicon=cDNA_insert,
+                terminators=cdna_cfg['amplicon_terminate'],
+                umi_map=umi_map, umi_pool_dict={},
+                u_label_by_ord=cd_r2_map, revcomp_by_ord=cd_r2_rev,
+                read_tag='r', builder=builder
+            )
 
-        for _ in range(n_reads):
-            q1_cd = quals_r1[qual_idx] if qual_idx < len(quals_r1) else phred_line_vectorized(read_len_for)
-            q2_cd = quals_r2[qual_idx] if qual_idx < len(quals_r2) else phred_line_vectorized(read_len_rev)
-            qual_idx += 1
-            if mean_phred(q1_cd) >= cdna_cfg['min_mean_qual'] and mean_phred(q2_cd) >= cdna_cfg['min_mean_qual']:
-                results.append((idx, r1_cd_const, q1_cd, r2_cd_const, q2_cd))
+            for _ in range(n_reads):
+                q1_cd = quals_r1[qual_idx] if qual_idx < len(quals_r1) else phred_line_vectorized(read_len_for)
+                q2_cd = quals_r2[qual_idx] if qual_idx < len(quals_r2) else phred_line_vectorized(read_len_rev)
+                qual_idx += 1
+                if mean_phred(q1_cd) >= cdna_cfg['min_mean_qual'] and mean_phred(q2_cd) >= cdna_cfg['min_mean_qual']:
+                    results.append((idx, r1_cd_const, q1_cd, r2_cd_const, q2_cd))
     
+    # print(len(results), "cdna reads from UMIs", start_idx, "to", end_idx)
     return results
 
 # ───────────────────── Optimized graph-driven simulation ─────────────
@@ -1053,6 +1070,7 @@ def simulate_from_graph(npz_path: str,
     L0 = cd_lens.get(0, ue_lens.get(0))
     L1 = cd_lens.get(1, ue_lens.get(1))
     L2 = ue_lens[2]
+    # print(f"Using UMI lengths: L0={L0}, L1={L1}, L2={L2}")
     if L0 is None or L1 is None:
         raise ValueError("Both UMI labels 0 and 1 must be defined")
 
@@ -1217,6 +1235,7 @@ def main():
     ap.add_argument("--dropout1", type=float, default=0.0)
     ap.add_argument("--encode-digits", default="ACGT")
     ap.add_argument("--encode-width", type=int, default=0)
+    ap.add_argument("--cdna-sample-file", help="one sample cDNA insert per line")
 
     # Simulate mode
     ap.add_argument("--uei-graph-npz", help="CSR .npz file")
@@ -1227,6 +1246,7 @@ def main():
     ap.add_argument("--avg-reads-uei", type=float, required=True)
     ap.add_argument("--min-reads-uei", type=int, default=1)
     ap.add_argument("--avg-reads-cdna", type=float)
+    ap.add_argument("--avg-subcluster-cdna", type=float)
     ap.add_argument("--min-reads-cdna", type=int)
     ap.add_argument("--use-uei-weights", action="store_true")
     ap.add_argument("--k-scale", type=float, default=1.0,
@@ -1265,6 +1285,7 @@ def main():
             dropout1=args.dropout1,
             encode_width=args.encode_width,
             encode_digits=args.encode_digits,
+            cdna_sample_file=args.cdna_sample_file,
             seed=args.seed,
         )
 

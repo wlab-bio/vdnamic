@@ -1,13 +1,13 @@
 import numpy as np
 import sysOps
-import itertools
-import optimOps
 import os
-import subprocess
 import re
 import pandas as pd
-from numpy import linalg as LA
-    
+import shlex 
+import textwrap
+import optimOps
+
+
 def get_alignment_length(cigar):
     length = 0
     numbers = re.findall('\d+', cigar)  # find all numbers in the cigar string
@@ -92,468 +92,654 @@ def get_gene_stats(filenames):
     
     return [str(sum(weight >= min_umi for weight in element_weights.values())) for min_umi in min_umis]
 
-def get_amp_consensus(seq_terminate_list,filter_umi0_amp_len,filter_umi1_amp_len,filter_umi0_quickmatch,filter_umi1_quickmatch,STARindexdir=None,gtffile=None,uei_matchfilepath=None,add_sequences_to_labelfiles=False):
-    #function will tally reads counted for each umi
-    
-    # line_sorted_clust_* has columns
-    # 1. source file line (ascending LEXICOGRAPHIC/NUM (0-padded) order)
-    # 2. cluster index
-    
+def escape_awk_var_for_shell(s_val):
+    """Quotes a value to be passed via awk -v var=value for shell safety."""
+    return shlex.quote(str(s_val))
+
+def escape_for_awk_printf_csv_field(s_val_raw):
+    """Prepares a string to be printed as a CSV field by AWK's printf, quoting it and escaping internal quotes."""
+    s_val = str(s_val_raw)
+    s_val = s_val.replace('"', '""')  # CSV standard: " -> ""
+    return f'"{s_val}"' # Enclose in double quotes
+
+
+# --- Main Function ---
+def get_amp_consensus(seq_terminate_list, 
+                      filter_umi0_amp_len, filter_umi1_amp_len, 
+                      filter_umi0_quickmatch, filter_umi1_quickmatch, 
+                      STARindexdir=None, gtffile=None, 
+                      uei_matchfilepath=None, add_sequences_to_labelfiles=False):
+    """
+    Generates amplicon consensus sequences, performs quick matching, aligns, annotates.
+    Includes k-mer based sub-clustering and robust intermediate file handling.
+    """
     match_str_list = [filter_umi0_quickmatch, filter_umi1_quickmatch]
     amp_len_list = [filter_umi0_amp_len, filter_umi1_amp_len]
+    gd = sysOps.globaldatapath
+    script_dir = os.path.dirname(os.path.realpath(__file__))
     
-    for amp_ind in range(2):
-        if sysOps.check_file_exists('amp' + str(amp_ind) + '.txt') and not sysOps.check_file_exists("sorted_umi_seq_assignments" +str(amp_ind) + ".txt"):
-            
-            if not sysOps.check_file_exists('amp' + str(amp_ind) + '_seqcons_trimmed.fasta'):
-                # amp*.txt has columns:
-                # 1. source file line (ascending LEXICOGRAPHIC/NUM (0-padded) order)
-                # 2. read 1 format index
-                # 3. read 2 format index
-                # 4. sequence
-                
-                sysOps.sh("join -t \",\" -1 1 -2 1 -o1.1,1.2,2.4 "
-                          + sysOps.globaldatapath + "line_sorted_clust_uxi" + str(amp_ind) + ".txt "
-                          + sysOps.globaldatapath + "amp" + str(amp_ind) + ".txt > " + sysOps.globaldatapath + "tmp_umi_amp.txt")
-                # tmp_umi_amp.txt has columns
-                # 1. source file line (ascending LEXICOGRAPHIC/NUM (0-padded) order)
-                # 2. UMI cluster index
-                # 3. sequence
-                
-                # sort LEXICOGRAPHICALLY by UMI cluster index
-                sysOps.big_sort(" -t \",\" -k2,2 ","tmp_umi_amp.txt","tmp_sorted_umi_amp.txt")
-                
-                os.remove(sysOps.globaldatapath + "tmp_umi_amp.txt")
-                
-                if sysOps.check_file_exists("amp" + str(amp_ind) + "_seqconsensus.txt"):
-                    os.remove(sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqconsensus.txt")
-                if sysOps.check_file_exists(sysOps.globaldatapath + "amp" + str(amp_ind) + "_maxtally.txt"):
-                    os.remove(sysOps.globaldatapath + "amp" + str(amp_ind) + "_maxtally.txt")
-                
-                cons_conditional = "seq = \"\"; maxtally=\"\"; for(i=1;i<=maxlen;i++){"
-                cons_conditional += "if(a[i]>c[i]&&a[i]>g[i]&&a[i]>t[i]){seq=(seq \"A\");maxtally=(maxtally a[i] \"/\" (a[i]+c[i]+g[i]+t[i]) \",\");}"
-                cons_conditional += "else if(c[i]>a[i]&&c[i]>g[i]&&c[i]>t[i]){seq=(seq \"C\");maxtally=(maxtally c[i] \"/\" (a[i]+c[i]+g[i]+t[i]) \",\");}"
-                cons_conditional += "else if(g[i]>a[i]&&g[i]>c[i]&&g[i]>t[i]){seq=(seq \"G\");maxtally=(maxtally g[i] \"/\" (a[i]+c[i]+g[i]+t[i]) \",\");}"
-                cons_conditional += "else if(t[i]>a[i]&&t[i]>c[i]&&t[i]>g[i]){seq=(seq \"T\");maxtally=(maxtally t[i] \"/\" (a[i]+c[i]+g[i]+t[i]) \",\");}"
-                cons_conditional += "else {seq=(seq \"N\");maxtally=(maxtally \"0/\" (a[i]+c[i]+g[i]+t[i]) \",\");}"
-                cons_conditional += "} print (prev_index \",\" myreads \",\" seq) >> \"" + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqconsensus.txt\";"
-                cons_conditional += "print maxtally >> \"" + sysOps.globaldatapath + "amp" + str(amp_ind) + "_maxtally.txt\";"
-                cons_conditional += "for(i=1;i<=150;i++){a[i]=0;c[i]=0;g[i]=0;t[i]=0;}"
-                
-                sysOps.throw_status('Writing consensus sequences to ' + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqconsensus.txt")
-                sysOps.sh("awk -F, 'BEGIN{prev_index=-1;maxlen = 0; myreads=0;for(i=1;i<=150;i++){a[i]=0;c[i]=0;g[i]=0;t[i]=0;}}"
-                          + "{if(prev_index != $2 && prev_index>=0){" + cons_conditional + "; maxlen = 0; myreads=0;}"
-                          + "len=length($3); myreads++; prev_index = $2; if(len>maxlen)maxlen=len; for(i=1;i<=len;i++)"
-                          + "{if(substr($3,i,1)==\"A\")a[i]++; else if(substr($3,i,1)==\"C\")c[i]++; else if(substr($3,i,1)==\"G\")g[i]++; else if(substr($3,i,1)==\"T\")t[i]++;}}"
-                          + "END{" + cons_conditional +"}' " + sysOps.globaldatapath + "tmp_sorted_umi_amp.txt")
-                os.remove(sysOps.globaldatapath + "tmp_sorted_umi_amp.txt")
-                
-                sysOps.throw_status("Trimming with termination-sequences: " + str(seq_terminate_list))
-                # trim seq_consensus using seq_terminate_list
-                with open(sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqconsensus.txt",'r') as amp_cons_file:
-                    amp_trimmed = open(sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt",'w')
-                    amp_trimmed_fasta = open(sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.fasta",'w')
-                    clustcounts = [0,0,0]
-                    for line in amp_cons_file:
-                        [umi_index,myreads,seq] = line.strip('\n').split(',')
-                        min_term_index = len(seq)
-                        for term_str in seq_terminate_list:
-                            if (term_str in seq) and (seq.index(term_str) < min_term_index):
-                                min_term_index = seq.index(term_str)
-                        
-                        if amp_len_list[amp_ind] is None or min_term_index >= amp_len_list[amp_ind]:
-                            amp_trimmed.write(','.join([umi_index,myreads,seq[:min_term_index]]) + '\n')
-                            amp_trimmed_fasta.write('>' + umi_index + '.' + str(myreads) + ':N:N\n' + seq[:min_term_index] + '\n')
-                            if int(myreads)==1:
-                                clustcounts[0] += 1
-                            elif int(myreads)==2:
-                                clustcounts[1] += 1
-                            else:
-                                clustcounts[2] += 1
-                        else:
-                            amp_trimmed.write(','.join([umi_index,myreads,'N']) + '\n')
-                            
-                    amp_trimmed.close()
-                    amp_trimmed_fasta.close()
-                    if sysOps.check_file_exists("pairing_stats.txt"):
-                        statsfilename = "pairing_stats.txt"
-                    else:
-                        statsfilename = "umi_stats.txt"
-                    with open(sysOps.globaldatapath + statsfilename,'a') as statsfile:
-                        statsfile.write(str(amp_ind) + 'amp:' + ','.join([str(x) for x in clustcounts]) + '\n')
-         
-            # amp*_seqcons_trimmed.txt
-            # umi index, reads, amplicon sequence
-                 
-            # amp*_seqcons_trimmed.fasta
-            # >umi index:reads \n amplicon sequence
-        
-            if not sysOps.check_file_exists("amp" + str(amp_ind) + "_seqcons_matches.txt"):
-                if (match_str_list[amp_ind] is not None):
-                    match_strs = list()
-                    added_str = ""
-                    if add_sequences_to_labelfiles:
-                        added_str = " \",\" $3"
-                    with open(sysOps.globaldatapath + match_str_list[amp_ind],'r') as matchfile:
-                        str_ind = 0
-                        for match_str in matchfile:
-                            my_match_str = match_str.strip('\n')
-                            min_unambig = min([i for i in range(len(my_match_str)) if my_match_str[i]!='N'])
-                            match_strs.append("if(substr($3,"+str(min_unambig+1)+"," + str(len(my_match_str)-min_unambig) + ")== \"" + my_match_str[min_unambig:] + "\"){print ($1 \",\" $2 \",\" " + str(str_ind) + added_str + ");}")
-                            str_ind += 1
-                        
-                    sysOps.throw_status('Performing quick-match on matches from ' + sysOps.globaldatapath + match_str_list[amp_ind] + '. Note: assignments will be ordered based on priority if quick-match inputs are ambiguous. Non-matches will be omitted')
-                    sysOps.sh("awk -F, '{" + " else ".join(match_strs) + " else{print ($1 \",\" $2 \",-1\" " + added_str + ");}}' " + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "  + sysOps.globaldatapath + "label_pt" + str(amp_ind) + ".txt")
-                elif add_sequences_to_labelfiles:
-                    sysOps.sh("awk -F, '{print ($1 \",\" $2 \",-1,\" $3);}' " + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "  + sysOps.globaldatapath + "label_pt" + str(amp_ind) + ".txt")
-            
-            if type(STARindexdir)==str and type(gtffile) == str and not sysOps.check_file_exists("sorted_umi_seq_assignments" +str(amp_ind) + ".txt"):
-                if not sysOps.check_file_exists(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam"):
-                    sysOps.throw_status('Running STAR aligner on amp-index ' + str(amp_ind))
-                    # Run genome aligner
-                    try:
-                        sysOps.sh('mkdir ' + sysOps.globaldatapath +"STARalignment" +str(amp_ind) + "/")
-                    except:
-                        pass
-                    sysOps.sh('STAR --genomeDir ' + sysOps.globaldatapath + STARindexdir + ' --runThreadN 2 --readFilesIn '  + sysOps.globaldatapath + 'amp' + str(amp_ind) + '_seqcons_trimmed.fasta' + ' --outFileNamePrefix ' + sysOps.globaldatapath + 'STARalignment' +str(amp_ind) +'/ --outSAMtype SAM --outSAMunmapped Within --outSAMattributes NH HI AS nM NM MD') 
-                # convert alignment file to csv
-                if not sysOps.check_file_exists("STARalignment" +str(amp_ind) + "/sorted_Aligned.out.sam.txt"):
-                    sysOps.throw_status("Calling awk -f " + os.path.dirname(os.path.realpath(__file__)) + "/filter_sam.awk " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt")
-                    sysOps.sh("awk -f " + os.path.dirname(os.path.realpath(__file__)) + "/filter_sam.awk " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt")
-                    # call filter_sam.awk in script directory
-                    # Aligned.out.sam.txt now has columns:
-                    
-                    # 1. "UMI"
-                    # 2. src_contig
-                    # 3. query name (UMI.readnum)
-                    # 4. start
-                    # 5. alignment_score
-                    # 6. cigar_str
-                    # 7. match percentage
-                    # 8. md
+    ephemeral_temp_files_overall = [] 
 
-                    sysOps.big_sort(" -k3,3 -k7rn,7 -k5rn,5 -t \",\" ", "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt", "STARalignment" +str(amp_ind) + "/tmp_sorted_Aligned.out.sam.txt")
-                    # retain only top matches
-                    sysOps.sh("awk -F, 'BEGIN{prev_query=-1;}{if($3 != prev_query || prev_score==$7){print ; prev_query=$3; prev_score=$7;}}' " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/tmp_sorted_Aligned.out.sam.txt > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/sorted_Aligned.out.sam.txt")
-                    os.remove(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/tmp_sorted_Aligned.out.sam.txt")
-                    sysOps.big_sort(" -k2,2 -k4n,4 -t \",\" ", "STARalignment" +str(amp_ind) + "/sorted_Aligned.out.sam.txt", "STARalignment" +str(amp_ind) + "/resorted_Aligned.out.sam.txt")
-                    os.remove(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/Aligned.out.sam.txt")
-                                        
-                    # resorted_Aligned.out.sam.txt now has columns:
-                    # 1. "UMI"
-                    # 2. src_contig (lex-sort)
-                    # 3. query name (UMI.readnum)
-                    # 4. start (num-sort)
-                    # 5. alignment_score
-                    # 6. cigar_str
-                    # 7. match percentage
-                    # 8. md
-                    
-                if not sysOps.check_file_exists("STARalignment" +str(amp_ind) + "/sorted_gtf.txt"):
-                    sysOps.sh("awk -F\" \" '{gsub(/\\\"|\;/,\"\"); src_contig = $1; feature=$3; start=$4; end=$5; gene_biotype=\"NONE\"; gene_name=\"NONE\"; transcript_name=\"NONE\"; gene_id=\"NONE\"; transcript_biotype=\"NONE\"; for(i=1;i<=NF-1;i++){"
-                              + "if($i == \"gene_biotype\"){gene_biotype=$(i+1);}"
-                              + "else if($i == \"gene_name\"){gene_name=$(i+1);}"
-                              + "else if($i == \"transcript_name\"){transcript_name=$(i+1);}"
-                              + "else if($i == \"transcript_biotype\"){transcript_biotype=$(i+1);}"
-                              + "else if($i == \"gene_id\"){gene_id=$(i+1);}"
-                              + "}"
-                              + "print NR \",\" src_contig \",\" feature \",\" start \",\" end \",\" gene_name \",\" gene_biotype \",\" gene_id \",\" transcript_name \",\" transcript_biotype;"
-                              + "print NR \",\" src_contig \",\" feature \",\" end \",\" start \",\" gene_name \",\" gene_biotype \",\" gene_id \",\" transcript_name \",\" transcript_biotype;}' " + sysOps.globaldatapath + gtffile + " > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/gtf.txt")
-                                                  
-                    # gtf.txt now has columns:
-                    # 1. NR (from 1)
-                    # 2. src_contig
-                    # 3. feature
-                    # 4. start or end
-                    # 5. end or start
-                    # 6. gene_name
-                    # 7. gene_biotype
-                    # 8. gene_id
-                    # 9. transcript_name
-                    # 10. transcript_biotype
-                    
-                    sysOps.big_sort(" -k2,2 -k4n,4 -t \",\" ", "STARalignment" +str(amp_ind) + "/gtf.txt", "STARalignment" +str(amp_ind) + "/sorted_gtf.txt")
-                    os.remove(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/gtf.txt")
-                    
-                sysOps.throw_status("Performing merge-sort of alignments and gene annotations ...")
-                sysOps.sh("sort -k2,2 -k4n,4 -t \",\" -m -T " + sysOps.globaldatapath + "tmp "
-                          + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/resorted_Aligned.out.sam.txt "
-                          + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/sorted_gtf.txt > " + sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/sorted_aligned_gtf.txt")
-                sysOps.throw_status("Annotating alignments ...")
-                current_flags = list() # list of row-numbers (as strings) to identify flags that denote beginning and end of an annotated feature
-                current_tags = list()   # list of all features (1st being row-number)
-                with open(sysOps.globaldatapath + "tmp_umi_assignments" +str(amp_ind) + ".txt",'w') as umi_assignments:
-                    with open(sysOps.globaldatapath + "STARalignment" +str(amp_ind) + "/sorted_aligned_gtf.txt",'r') as align_gtf_file:
-                        for align_gtf_line in align_gtf_file:
-                            line_str = align_gtf_line.strip('\n')
-                            if line_str.startswith('UMI'):
-                                line_str = line_str.split(',')
-                                [umi_index,read_num] = line_str[2].split(':')[0].split('.')
-                                if len(current_tags)>0: # input data
-                                    # reconcile mappings
-                                    mappings = list([list([str(current_tags[0][j])]) for j in range(len(current_tags[0]))])
-                                    for i in range(1,len(current_tags)):
-                                        for j in range(len(current_tags[i])):
-                                            mappings[j].append(str(current_tags[i][j]))
-                                                                
-                                    for j in range(len(mappings)):
-                                        mappings[j] = '|'.join(mappings[j])
-                                    
-                                    if 'rRNA' in mappings[1] or 'rRNA' in mappings[6]:
-                                        attention_rank = "1"
-                                    elif str.isnumeric(mappings[1]) or 'MT' in mappings[1]:
-                                        attention_rank = "2"
-                                    else:
-                                        attention_rank = "3"
-                                    
-                                    mut_str = get_internal_mismatches(line_str[5], line_str[7], line_str[3])
-                                    if mappings[5].lower() != 'none':
-                                        umi_assignments.write(",".join([umi_index,line_str[3],mut_str]) + "," + ",".join([mappings[1],mappings[5],mappings[6],mappings[8],read_num,attention_rank]) + '\n')
-                                    else:
-                                        umi_assignments.write(",".join([umi_index,line_str[3],mut_str]) + "," + ",".join([mappings[1],mappings[7],mappings[6],mappings[8],read_num,attention_rank]) + '\n') # if no gene name in gtf file, apply ensembl id
-                                else:
-                                    mut_str = get_internal_mismatches(line_str[5], line_str[7], line_str[3])
-                                    umi_assignments.write(",".join([umi_index,line_str[3],mut_str]) + "," + ",".join([line_str[1],"NA","genome","NA",read_num,"4"]) + '\n')
-                                # tmp_umi_assignments* now has columns:
-                                # 1. UMI index
-                                # 2. alignment start
-                                # 3. mutation string
-                                # 4. src_contig
-                                # 5. gene id
-                                # 6. gene biotype
-                                # 7. transcript name
-                                # 8. read num
-                                # 9. attention rank: (rRNA=1,other/numerical contig=2,other/random contig=3,genome/NA=4)
-                            elif not line_str.startswith('UMI'): # is a GTF feature
-                                line_str = line_str.split(',')
-                                if line_str[0] in current_flags:
-                                    rm_index = current_flags.index(line_str[0])
-                                    del current_flags[rm_index], current_tags[rm_index]
-                                else:
-                                    current_flags.append(str(line_str[0]))
-                                    current_tags.append(list(line_str))
-                
-                # sort umi assignments lexicographically by UMI/cluster index
-                sysOps.big_sort(" -k1,1 -k9n,9 -t \",\" ","tmp_umi_assignments" +str(amp_ind) + ".txt", "tmp_sorted_umi_assignments" +str(amp_ind) + ".txt")
-                # 1. query-name  (lex-sort)
-                # 2. alignment start
-                # 3. mutation string
-                # 4. src_contig
-                # 5. gene id
-                # 6. gene biotype
-                # 7. transcript name
-                # 8. read-num
-                # 9. attention rank: (rRNA=1,other/numerical contig=2,other/random contig=3,genome/NA=4)
-                sysOps.sh("rm " + sysOps.globaldatapath + "tmp_umi_assignments*" +str(amp_ind) + ".txt")
-                
-                # consolidate query listings
-                with open(sysOps.globaldatapath + "umi_assignments" +str(amp_ind) + ".txt",'w') as umi_assignments:
-                    with open(sysOps.globaldatapath + "tmp_sorted_umi_assignments" +str(amp_ind) + ".txt",'r') as umi_assignment_file:
-                        current_assignment = None
-                        for line in umi_assignment_file:
-                            umi_assignment = line.strip('\n').split(',')
-                            if current_assignment is None:
-                                current_assignment = list([[el] for el in umi_assignment])
-                            elif current_assignment[0][0] == umi_assignment[0]: # if query name is the same
-                                if current_assignment[8][0] == umi_assignment[8]: # if attention level is the same
-                                    for i in range(len(current_assignment)):
-                                        if umi_assignment[i] not in current_assignment[i]:
-                                            current_assignment[i].append(str(umi_assignment[i]))
-                            else:
-                                for i in range(len(current_assignment)):
-                                    current_assignment[i] = '|'.join(current_assignment[i])
-                                umi_assignments.write(','.join(current_assignment[:8]) + '\n')
-                                current_assignment = list([[el] for el in umi_assignment])
-                                        
-                        for i in range(len(current_assignment)):
-                            current_assignment[i] = '|'.join(current_assignment[i])
-                        umi_assignments.write(','.join(current_assignment[:8]))
-                
-                # umi_assignments* contains columns:
-                # 1. query-name (UMI only)
-                # 2. start/s
-                # 3. mutation string/s
-                # 4. src_contig/s
-                # 5. gene id/s
-                # 6. gene biotype/s
-                # 7. transcript name/s
-                # 8. read number
-                
-                sysOps.big_sort(" -k2,2 -t \",\" ","max_base_use_uxi" +str(amp_ind) + ".txt", "seqindex_sorted_uxi" +str(amp_ind) + ".txt")
-                # seqindex_sorted_uxi* has columns
-                # 1. unique sequence
-                # 2. unique sequence indices (LEX SORT)
-                # 3. max base counts AS FRACTION OF UXI LENGTH
-                                
-                # seq_sort_clust_* has columns
-                # 1. seq_index (sorted LEXICOGRAPHICALLY)
-                # 2. cluster_ind
-                
-                sysOps.sh("join -t \",\" -1 2 -2 1 -o1.1,1.2,2.2 " + sysOps.globaldatapath + "seqindex_sorted_uxi" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "seq_sort_clust_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "tmp_seq_sort_clust_uxi" +str(amp_ind) + ".txt")
-                # tmp_seq_sort_clust_uxi* has columns
-                # 1. umi sequence
-                # 2. unique sequence index (LEX SORT)
-                # 3. cluster_ind
-                
-                sysOps.big_sort(" -k3,3 -t \",\" ","tmp_seq_sort_clust_uxi" +str(amp_ind) + ".txt", "clust_sort_clust_uxi" +str(amp_ind) + ".txt")
-                # clust_sort_clust_uxi* has columns
-                # 1. umi sequence
-                # 2. unique sequence index
-                # 3. cluster_ind (LEX SORT)
-                
-                sysOps.sh("join -t \",\" -1 3 -2 1 -o1.1,1.2,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.1 " + sysOps.globaldatapath + "clust_sort_clust_uxi" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "umi_assignments" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
-                # umi_seq_assignments* has columns:
-                # 1. umi sequence
-                # 2. unique sequence index
-                # 3. start/s
-                # 4. mutation string/s
-                # 5. src_contig/s
-                # 6. gene id/s
-                # 7. gene biotype/s
-                # 8. transcript name/s
-                # 9. number of reads
-                # 10. query-name (UMI only)
-                
-                if add_sequences_to_labelfiles:
-                    sysOps.throw_status('Adding raw sequences to alignment output ' + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
-                    os.rename(sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt", sysOps.globaldatapath + "tmp_umi_seq_assignments" +str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k10,10 -t \",\" ","tmp_umi_seq_assignments" +str(amp_ind) + ".txt", "tmp_sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k1,1 -t \",\" ","amp" +str(amp_ind) + "_seqcons_trimmed.txt", "tmp_sorted_amp" +str(amp_ind) + "_seqcons_trimmed.txt")
-                    sysOps.sh("join -t \",\" -1 10 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.3 " + sysOps.globaldatapath + "tmp_sorted_umi_seq_assignments" +str(amp_ind) + ".txt " + sysOps.globaldatapath + "tmp_sorted_amp" +str(amp_ind) + "_seqcons_trimmed.txt > " + sysOps.globaldatapath + "umi_seq_assignments" +str(amp_ind) + ".txt")
-                    sysOps.throw_status('Done.')
-               
-                sysOps.sh("rm " + sysOps.globaldatapath + "tmp*seq*")
-                    
-                # sort by umi sequence
-                sysOps.big_sort(" -k1,1 -t \",\" ","umi_seq_assignments" +str(amp_ind) + ".txt", "sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
-                # sorted_umi_seq_assignments* has columns
-                # 1. UMI sequence (LEX SORT)
-                # 2. unique-sequence index
-                # 3. start/s
-                # 4. mutation string/s
-                # 5. src_contig/s
-                # 6. gene id/s
-                # 7. gene biotype/s
-                # 8. transcript name/s
-                # 9. number of reads
-                # 10. cDNA UMI index *or* query sequence if add_sequences_to_labelfiles = TRUE
-            
-            elif (uei_matchfilepath is not None):
-                # 1) Build clust→(umi seq, uniq-seq index) table if missing
-                if not sysOps.check_file_exists("clust_sort_clust_uxi" + str(amp_ind) + ".txt"):
-                    sysOps.big_sort(" -k2,2 -t \",\" ",
-                                    "max_base_use_uxi" + str(amp_ind) + ".txt",
-                                    "seqindex_sorted_uxi" + str(amp_ind) + ".txt")
-                    # seqindex_sorted_uxi: (umi_seq, uniq_seq_index, max_base_frac)
-                    # join with seq_sort_clust_uxi: (uniq_seq_index, cluster_ind)
-                    sysOps.sh("join -t \",\" -1 2 -2 1 -o1.1,1.2,2.2 "
-                                + sysOps.globaldatapath + "seqindex_sorted_uxi" + str(amp_ind) + ".txt "
-                                + sysOps.globaldatapath + "seq_sort_clust_uxi" + str(amp_ind) + ".txt > "
-                                + sysOps.globaldatapath + "tmp_seq_sort_clust_uxi" + str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k3,3 -t \",\" ",
-                                    "tmp_seq_sort_clust_uxi" + str(amp_ind) + ".txt",
-                                    "clust_sort_clust_uxi" + str(amp_ind) + ".txt")
-                # 2) Fabricate umi_assignments (STAR-less) from amplicon consensus tallies
-                #    Format must be: cluster_ind,start,mut,contig,gene_id,biotype,transcript,Nreads,query_name
-                sysOps.sh("awk -F, '{print $1 \",-1,None,NA,NA,NA,NA,\" $2 \",\" $1;}' "
-                            + sysOps.globaldatapath + "amp" + str(amp_ind) + "_seqcons_trimmed.txt > "
-                            + sysOps.globaldatapath + "umi_assignments" + str(amp_ind) + ".txt")
-                # 3) Join to produce umi_seq_assignments (same schema as STAR path)
-                sysOps.sh("join -t \",\" -1 3 -2 1 -o1.1,1.2,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.1 " \
-                            + sysOps.globaldatapath + "clust_sort_clust_uxi" + str(amp_ind) + ".txt " \
-                            + sysOps.globaldatapath + "umi_assignments" + str(amp_ind) + ".txt > " \
-                            + sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt")
-                # 4) If requested, also attach raw consensus sequences to the last column
-                if add_sequences_to_labelfiles:
-                    os.rename(sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt",
-                                sysOps.globaldatapath + "tmp_umi_seq_assignments" + str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k10,10 -t \",\" ", "tmp_umi_seq_assignments" + str(amp_ind) + ".txt",
-                                    "tmp_sorted_umi_seq_assignments" + str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k1,1 -t \",\" ", "amp" + str(amp_ind) + "_seqcons_trimmed.txt",
-                                    "tmp_sorted_amp" + str(amp_ind) + "_seqcons_trimmed.txt")
-                    sysOps.sh("join -t \",\" -1 10 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.3 " \
-                                + sysOps.globaldatapath + "tmp_sorted_umi_seq_assignments" + str(amp_ind) + ".txt " \
-                                + sysOps.globaldatapath + "tmp_sorted_amp" + str(amp_ind) + "_seqcons_trimmed.txt > " \
-                                + sysOps.globaldatapath + "umi_seq_assignments" + str(amp_ind) + ".txt")
-                # 5) Final sort to materialize sorted_umi_seq_assignments*.txt
-                sysOps.big_sort(" -k1,1 -t \",\" ",
-                                "umi_seq_assignments" + str(amp_ind) + ".txt",
-                                "sorted_umi_seq_assignments" + str(amp_ind) + ".txt")
+    common_tmp_dir_for_sort = os.path.join(gd, "tmp")
+    if not os.path.exists(common_tmp_dir_for_sort):
+        os.makedirs(common_tmp_dir_for_sort, exist_ok=True)
+    sort_temp_dir_option = f"-T {shlex.quote(common_tmp_dir_for_sort)}"
 
+    # Main try block for the entire function to ensure finally clause executes
+    if True: 
+        for amp_ind in range(2):
+            sysOps.throw_status(f"--- Processing amp_ind: {amp_ind} ---")
+            # --- Define all file paths for this amp_ind iteration ---
+            amp_file_path = gd + f'amp{amp_ind}.txt'
+            line_sorted_clust_uxi_path = gd + f"line_sorted_clust_uxi{amp_ind}.txt"
+            sorted_assignments_file_path = gd + f"sorted_umi_seq_assignments{amp_ind}.txt"
+            
+            consensus_fasta_file_path = gd + f'amp{amp_ind}_seqcons_trimmed.fasta'
+            amp_trimmed_txt_out_file = gd + f"amp{amp_ind}_seqcons_trimmed.txt"
+            trimmed_fragments_file_path = gd + f"amp{amp_ind}_seqcons_trimmed_fragments.txt"
+
+            tmp_umi_amp_path = gd + f"tmp_umi_amp_{amp_ind}.txt"
+            tmp_umi_amp_k_path = gd + f"tmp_umi_amp_k_{amp_ind}.txt"
+            tmp_sorted_umi_amp_k_path = gd + f"tmp_sorted_umi_amp_k_{amp_ind}.txt"
+            seqconsensus_out_file = gd + f"amp{amp_ind}_seqconsensus.txt" # UMI_idx, TotalReads, "cons1:reads1;..."
+            subclusters_raw_out_file = gd + f"amp{amp_ind}_subclusters.txt" # full_query_name, raw_sub_consensus
+            consensus_awk_script_path = gd + f"tmp_consensus_script_{amp_ind}.awk"
+            
+            label_pt_file = gd + f"label_pt{amp_ind}.txt"
+            quick_match_awk_script_path = gd + f"tmp_quick_match_{amp_ind}.awk"
+
+            star_output_dir = gd + f"STARalignment{amp_ind}/"
+            star_sam_file = star_output_dir + "Aligned.out.sam"
+            processed_alignments_txt = star_output_dir + "Aligned.out.sam.txt"
+            tmp_sorted_aligned_sam_path = star_output_dir + "tmp_sorted_sam.txt"
+            sorted_aligned_sam_path_intermediate = star_output_dir + "sorted_sam.txt"
+            final_sorted_alignments_for_merge = star_output_dir + "resorted_sam.txt"
+            
+            gtf_awk_script_path = gd + f"tmp_gtf_parser_{amp_ind}.awk"
+            gtf_processed_file = star_output_dir + "gtf.txt"
+            gtf_sorted_file = star_output_dir + "sorted_gtf.txt"
+            merged_algn_gtf_file = star_output_dir + "sorted_aligned_gtf.txt"
+            
+            tmp_umi_assignments_file = gd + f"tmp_umi_assignments_{amp_ind}.txt"
+            tmp_sorted_umi_assignments_file = gd + f"tmp_sorted_umi_assignments_{amp_ind}.txt"
+            consolidated_umi_assignments_file = gd + f"umi_assignments_{amp_ind}.txt" # Output of consolidation
+            
+            seqindex_sorted_uxi_path = gd + f"seqindex_sorted_uxi_{amp_ind}.txt"
+            tmp_seq_sort_clust_path = gd + f"tmp_seq_sort_clust_uxi_{amp_ind}.txt"
+            clust_sort_clust_path = gd + f"clust_sort_clust_uxi_{amp_ind}.txt"
+            umi_seq_assignments_file_temp = gd + f"umi_seq_assignments_temp_{amp_ind}.txt" 
+            final_umi_seq_assignments_path = gd + f"umi_seq_assignments_{amp_ind}.txt" 
+            
+            tmp_assign_qname_path = gd + f"tmp_assign_qname_{amp_ind}.txt"
+            tmp_frags_qname_path = gd + f"tmp_frags_qname_{amp_ind}.txt"
+
+            # Add AWK script paths to overall cleanup list
+            ephemeral_temp_files_overall.extend([consensus_awk_script_path, quick_match_awk_script_path, gtf_awk_script_path])
+            if not (sysOps.check_file_exists(amp_file_path, "./") and sysOps.check_file_exists(line_sorted_clust_uxi_path, "./")):
+                sysOps.throw_status(f"Skipping amp_ind {amp_ind}: Input files missing {amp_file_path}, {line_sorted_clust_uxi_path}")
+                continue
+            if sysOps.check_file_exists(sorted_assignments_file_path, "./"):
+                sysOps.throw_status(f"Skipping amp_ind {amp_ind}: Final output {sorted_assignments_file_path} already exists.")
+                continue
+            # --- STAGE 1: Generate Consensus Sequences ---
+            stage1_outputs_exist = (sysOps.check_file_exists(consensus_fasta_file_path, "./") and
+                                    sysOps.check_file_exists(amp_trimmed_txt_out_file, "./") and
+                                    sysOps.check_file_exists(trimmed_fragments_file_path, "./"))
+            if not stage1_outputs_exist:
+                sysOps.throw_status(f"STAGE 1: Generating consensus for amp{amp_ind}")
+                
+                # Clean potential stale files for this stage before creating them
+                stage1_files_to_clean_before_run = [tmp_umi_amp_path, tmp_umi_amp_k_path, tmp_sorted_umi_amp_k_path,
+                                   seqconsensus_out_file, subclusters_raw_out_file,
+                                   amp_trimmed_txt_out_file, trimmed_fragments_file_path, consensus_fasta_file_path]
+                for f_path in stage1_files_to_clean_before_run:
+                    if sysOps.check_file_exists(f_path, "./") and os.path.exists(f_path): os.remove(f_path)
+                
+                maxtally_file_path = gd + f"amp{amp_ind}_maxtally.txt" # No longer generated
+                if sysOps.check_file_exists(maxtally_file_path, "./"): os.remove(maxtally_file_path)
+
+                cmd_join_umi_seq = f"join -t ',' -1 1 -2 1 -o1.1,1.2,2.4 {shlex.quote(line_sorted_clust_uxi_path)} {shlex.quote(amp_file_path)} > {shlex.quote(tmp_umi_amp_path)}"
+                sysOps.sh(cmd_join_umi_seq); ephemeral_temp_files_overall.append(tmp_umi_amp_path)
+
+                # Input to awk: $1=src_line, $2=UMI_idx, $3=sequence (from join's 2.4)
+                cmd_add_kmer = f"awk -F',' '{{kmer = substr($3,1,10); print $1\",\"$2\",\"kmer\",\"$3}}' {shlex.quote(tmp_umi_amp_path)} > {shlex.quote(tmp_umi_amp_k_path)}"
+                sysOps.sh(cmd_add_kmer); ephemeral_temp_files_overall.append(tmp_umi_amp_k_path)
+                if sysOps.check_file_exists(tmp_umi_amp_path, "./") and os.path.exists(tmp_umi_amp_path): os.remove(tmp_umi_amp_path)
+                
+                sysOps.big_sort(f" {sort_temp_dir_option} -t ',' -k2,2 -k3,3 ", tmp_umi_amp_k_path, tmp_sorted_umi_amp_k_path, "./")
+                if sysOps.check_file_exists(tmp_umi_amp_k_path, "./") and os.path.exists(tmp_umi_amp_k_path): os.remove(tmp_umi_amp_k_path)
+                ephemeral_temp_files_overall.append(tmp_sorted_umi_amp_k_path)
+                
+                sysOps.throw_status(f'Writing k-mer sub-cluster consensus sequences via AWK for amp{amp_ind}')
+                consensus_awk_script_content = textwrap.dedent(f"""\
+                BEGIN {{
+                    prev_umi = -1; prev_kmer = ""; OFS=",";
+                    seqOutFile = ARGV[ARGC-2]; 
+                    subOutFile = ARGV[ARGC-1];
+                    ARGC -= 2; 
+                    delete consStore; delete readSumStore; 
+                    init_arrays(); 
+                }}
+                function init_arrays( i_clear_loop) {{
+                    for (i_clear_loop=1; i_clear_loop<=300; ++i_clear_loop) {{ A[i_clear_loop]=0; C[i_clear_loop]=0; G[i_clear_loop]=0; T[i_clear_loop]=0; }}
+                    maxlen = 0; myreads = 0; 
+                }}
+                function flush_cluster( i, consensus_fragment, total_counts_at_pos, sub_cluster_info) {{
+                    if (prev_umi == -1) {{ init_arrays(); return; }}
+                    is_valid_sub_cluster = (myreads >= 2);
+                    if(is_valid_sub_cluster) {{
+                        consensus_fragment = "";
+                        for(i=1; i<=maxlen; i++) {{
+                            total_counts_at_pos = (A[i]?A[i]:0)+(C[i]?C[i]:0)+(G[i]?G[i]:0)+(T[i]?T[i]:0);
+                            if (total_counts_at_pos == 0) {{ consensus_fragment = consensus_fragment "N"; }}
+                            else if(A[i]>C[i] && A[i]>G[i] && A[i]>T[i]) {{ consensus_fragment = consensus_fragment "A"; }}
+                            else if(C[i]>A[i] && C[i]>G[i] && C[i]>T[i]) {{ consensus_fragment = consensus_fragment "C"; }}
+                            else if(G[i]>A[i] && G[i]>C[i] && G[i]>T[i]) {{ consensus_fragment = consensus_fragment "G"; }}
+                            else if(T[i]>A[i] && T[i]>C[i] && T[i]>G[i]) {{ consensus_fragment = consensus_fragment "T"; }}
+                            else {{ consensus_fragment = consensus_fragment "N"; }}
+                        }}
+                        sub_cluster_info = consensus_fragment ":" myreads;
+                        if(prev_umi in consStore) {{
+                           consStore[prev_umi] = consStore[prev_umi] ";" sub_cluster_info;
+                           readSumStore[prev_umi] += myreads; 
+                        }} else {{
+                           consStore[prev_umi] = sub_cluster_info;
+                           readSumStore[prev_umi] = myreads;
+                        }}
+                    }}
+                    init_arrays(); 
+                }}
+                {{ 
+                    current_umi = $2; current_kmer = $3; current_seq = $4; # Input: tmp_sorted_umi_amp_k_path
+                    if( (current_umi != prev_umi) || (current_kmer != prev_kmer) ) {{
+                        if (prev_umi != -1) {{ flush_cluster(); }} 
+                        else {{ init_arrays(); }} 
+                        prev_umi = current_umi; prev_kmer = current_kmer; 
+                    }}
+                    len = length(current_seq); if(len > maxlen) maxlen = len;
+                    myreads++; 
+                    for(i=1; i<=len; i++) {{
+                       base = substr(current_seq,i,1);
+                       if(base=="A") A[i]++; else if(base=="C") C[i]++;
+                       else if(base=="G") G[i]++; else if(base=="T") T[i]++;
+                    }}
+                }}
+                END {{
+                     if (prev_umi != -1) {{ flush_cluster(); }} 
+                     for(u_idx in consStore) {{ 
+                         printf("%s,%d,%s\\n", u_idx, readSumStore[u_idx], consStore[u_idx]) >> seqOutFile;
+                         num_sub_clusters_in_store = split(consStore[u_idx], sub_array_in_store, ";");
+                         for(k_idx=1; k_idx <= num_sub_clusters_in_store; k_idx++) {{
+                             split(sub_array_in_store[k_idx], pieces_in_store, ":");
+                             read_pad = sprintf("%07d", pieces_in_store[2]);   # 7 digits fits 10 M reads
+                             full_query_name_generated = u_idx "." read_pad ".sub" (k_idx-1);
+                             printf("%s,%s\\n", full_query_name_generated, pieces_in_store[1]) >> subOutFile;
+                         }}
+                     }}
+                }}
+                """)
+                with open(consensus_awk_script_path, 'w') as f_awk: f_awk.write(consensus_awk_script_content)
+                cmd_awk_consensus = (f"awk -F, -f {shlex.quote(consensus_awk_script_path)} "
+                                     f"{shlex.quote(tmp_sorted_umi_amp_k_path)} " 
+                                     f"{shlex.quote(seqconsensus_out_file)} {shlex.quote(subclusters_raw_out_file)}")
+                sysOps.sh(cmd_awk_consensus)
+                if sysOps.check_file_exists(tmp_sorted_umi_amp_k_path, "./") and os.path.exists(tmp_sorted_umi_amp_k_path):
+                    os.remove(tmp_sorted_umi_amp_k_path)
+
+                sysOps.throw_status(f"Trimming sub-consensuses and generating FASTA/Fragments for amp{amp_ind}")
+                umi_level_trimmed_subs_map = {} 
+                written_any_to_trimmed_txt = False
+                with open(subclusters_raw_out_file, 'r') as f_subclusters_in, \
+                     open(trimmed_fragments_file_path, 'w') as f_trimmed_fragments_out, \
+                     open(consensus_fasta_file_path, 'w') as f_final_fasta_out:
+                    for line in f_subclusters_in:
+                        parts = line.strip().split(",", 1)
+                        if len(parts) != 2: continue
+                        full_query_name, raw_sub_consensus_seq = parts
+                        current_umi_idx = full_query_name.split('.')[0]
+                        trimmed_seq = raw_sub_consensus_seq
+                        min_term_idx = len(trimmed_seq)
+                        if seq_terminate_list:
+                            for term_str in seq_terminate_list:
+                                term_pos = trimmed_seq.find(term_str)
+                                if term_pos != -1 and term_pos < min_term_idx: min_term_idx = term_pos
+                        trimmed_seq = trimmed_seq[:min_term_idx]
+                        if amp_len_list[amp_ind] is not None and len(trimmed_seq) < amp_len_list[amp_ind]:
+                            trimmed_seq = "N"
+                        if trimmed_seq != "N": 
+                            f_final_fasta_out.write(f">{full_query_name}:N:N\n{trimmed_seq}\n")
+                            f_trimmed_fragments_out.write(f"{full_query_name},{trimmed_seq}\n")
+                        if current_umi_idx not in umi_level_trimmed_subs_map: umi_level_trimmed_subs_map[current_umi_idx] = []
+                        umi_level_trimmed_subs_map[current_umi_idx].append(trimmed_seq)
+                
+                cluster_counts_overall = [0,0,0]
+                with open(seqconsensus_out_file, 'r') as f_umi_totals_in, \
+                     open(amp_trimmed_txt_out_file, 'w') as f_final_trimmed_txt_out:
+                    for line in f_umi_totals_in:
+                        parts = line.strip().split(",", 2)
+                        if len(parts) != 3: continue
+                        umi_idx, total_reads_str, _ = parts
+                        if umi_idx in umi_level_trimmed_subs_map:
+                            surviving_subs_for_umi = [s for s in umi_level_trimmed_subs_map[umi_idx] if s != "N"]
+                            if surviving_subs_for_umi: 
+                                written_any_to_trimmed_txt = True
+                                concatenated_subs_to_write = ";".join(umi_level_trimmed_subs_map[umi_idx])
+                                f_final_trimmed_txt_out.write(f"{umi_idx},{total_reads_str},{concatenated_subs_to_write}\n")
+                                total_reads_int = int(total_reads_str) 
+                                if total_reads_int == 2: cluster_counts_overall[0] += 1
+                                elif total_reads_int == 3: cluster_counts_overall[1] += 1
+                                elif total_reads_int >= 4: cluster_counts_overall[2] += 1
+                
+                # PATCH D: Fix empty file guard
+                if not written_any_to_trimmed_txt and os.path.exists(amp_trimmed_txt_out_file):
+                    os.remove(amp_trimmed_txt_out_file)        # nothing survived → delete
+
+                stats_file_to_append = gd + "pairing_stats.txt" if sysOps.check_file_exists("pairing_stats.txt") else gd + "umi_stats.txt"
+                with open(stats_file_to_append, 'a') as statsfile:
+                    statsfile.write(f"{amp_ind}amp:{','.join(map(str, cluster_counts_overall))}\n")
+                if sysOps.check_file_exists(subclusters_raw_out_file, "./") and os.path.exists(subclusters_raw_out_file):
+                    os.remove(subclusters_raw_out_file)
             else:
-                sysOps.throw_status('No genome directory provided, skipping alignment.')
-                
-    if False not in [sysOps.check_file_exists("sorted_umi_seq_assignments" + str(amp_ind) + ".txt") for amp_ind in range(2)]:
-        sysOps.throw_status("Getting gene stats ...")
-        with open(sysOps.globaldatapath + "gene_stats.txt",'w') as outfile:
-            outfile.write(",".join([str(s) for s in get_gene_stats(["sorted_umi_seq_assignments" + str(amp_ind) + ".txt" for amp_ind in range(2)])]))
-        sysOps.throw_status("Done.")
-                                
-    for amp_ind in range(2):
-        if sysOps.check_file_exists("sorted_umi_seq_assignments" + str(amp_ind) + ".txt") and uei_matchfilepath is not None:
-            for uei_path in uei_matchfilepath.split('+'):
-                # collect UEI information
-                sysOps.big_sort(" -k2,2 -t \",\" ", uei_path + "max_base_use_uxi" +str(amp_ind) + ".txt", "sorted_UEIdata_uxi" +str(amp_ind) + ".txt")
-                # sorted_UEIdata_uxi* has columns
-                # 1. unique sequence
-                # 2. unique sequence indices (LEX SORT)
-                # 3. max base counts AS FRACTION OF UXI LENGTH
-                # 4. number of reads
-                            
-                # uei_path//seq_sort_clust_* has columns
-                # 1. seq_index (sorted LEXICOGRAPHICALLY)
-                # 2. cluster_ind
-                sysOps.sh("join -t \",\" -1 2 -2 1 -o1.1,1.2,2.2,1.4 " + sysOps.globaldatapath + "sorted_UEIdata_uxi" +str(amp_ind) + ".txt " + sysOps.globaldatapath + uei_path + "seq_sort_clust_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt")
-                # tmp_UEIdata_uxi* has columns
-                # 1. unique UMI sequence (from UEI file)
-                # 2. unique sequence index (from UEI file; LEX SORT)
-                # 3. cluster_ind
-                # 4. number of UEI reads
-                
-                # allowing mismatch
-                num_chars = len(sysOps.sh("tail -1 " +  sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt").split(',')[0])
-                sysOps.throw_status("Allowing mismatch across num_chars = " + str(num_chars))
-                for i in range(num_chars):
-                    sysOps.sh("sed 's/.//" + str(i+1) + "' " + sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "mis" + str(i+1) + "_UEIdata_uxi" +str(amp_ind) + ".txt")
-                    sysOps.sh("sed 's/.//" + str(i+1) + "' " + sysOps.globaldatapath + "sorted_umi_seq_assignments" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "mis" + str(i+1) + "_sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k1,1 -t \",\" ", "mis" + str(i+1) + "_UEIdata_uxi" +str(amp_ind) + ".txt", "sorted_mis" + str(i+1) + "_UEIdata_uxi" +str(amp_ind) + ".txt")
-                    sysOps.big_sort(" -k1,1 -t \",\" ", "mis" + str(i+1) + "_sorted_umi_seq_assignments" +str(amp_ind) + ".txt", "sorted_mis" + str(i+1) + "_sorted_umi_seq_assignments" +str(amp_ind) + ".txt")
-                    sysOps.sh("join -t ',' -1 1 -2 1 -o2.3,1.3,1.4,1.5,1.6,1.7,1.8,1.9,1.10,2.4 " + sysOps.globaldatapath + "sorted_mis" + str(i+1) + "_sorted_umi_seq_assignments" + str(amp_ind) + ".txt " + sysOps.globaldatapath +  "sorted_mis" + str(i+1) + "_UEIdata_uxi" +str(amp_ind) + ".txt >> " + sysOps.globaldatapath + "unsorted_label_pt" +str(amp_ind) + ".txt")
-                    sysOps.sh("rm " + sysOps.globaldatapath + "*mis" + str(i+1) + "_*")
-                    
-                '''
-                sysOps.big_sort(" -k1,1 -t \",\" ", "tmp_UEIdata_uxi" +str(amp_ind) + ".txt", "UEIdata_uxi" +str(amp_ind) + ".txt")
-                # UEIdata_uxi* has columns
-                # 1. unique UMI sequence (from UEI file; LEX SORT)
-                # 2. unique sequence index (from UEI file)
-                # 3. cluster_ind
-                # 4. number of UEI reads
-                sysOps.sh("join -t ',' -1 1 -2 1 -o2.3,1.3,1.4,1.5,1.6,1.7,1.8,1.9,1.10,2.4 " + sysOps.globaldatapath + "sorted_umi_seq_assignments" + str(amp_ind) + ".txt " + sysOps.globaldatapath + "UEIdata_uxi" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + "unsorted_label_pt" +str(amp_ind) + ".txt")
-                '''
-                
-                # unsorted_label_pt* has columns
-                # 1. UEI-dataset cluster index
-                # 2-9. UMI assignments
-                # 10. number of UEI reads
+                sysOps.throw_status(f"STAGE 1: Skipped for amp{amp_ind}, key output files exist.")
 
-                # sort by UEI-data set cluster index
-                sysOps.big_sort(" -k1,1 -k8rn,8 -k10rn,10 -t \",\" ", "unsorted_label_pt" +str(amp_ind) + ".txt", "tmp_label_pt" +str(amp_ind) + ".txt")
-                # output only one row per cluster
-                sysOps.sh("awk -F, 'BEGIN{prev_clust = -1;}{if($1 != prev_clust){print ;} prev_clust = $1;}' " + sysOps.globaldatapath + "tmp_label_pt" +str(amp_ind) + ".txt > " + sysOps.globaldatapath + uei_path + "label_pt" +str(amp_ind) + ".txt")
-                os.remove(sysOps.globaldatapath + "unsorted_label_pt" +str(amp_ind) + ".txt")
-                os.remove(sysOps.globaldatapath + "tmp_label_pt" +str(amp_ind) + ".txt")
-                os.remove(sysOps.globaldatapath + "sorted_UEIdata_uxi" +str(amp_ind) + ".txt")
-                os.remove(sysOps.globaldatapath + "tmp_UEIdata_uxi" +str(amp_ind) + ".txt")
-    '''
-    for amp_ind in range(2):
-        if sysOps.check_file_exists("STARalignment" + str(amp_ind) + "/Aligned.out.sam"):
-            if True: #run_velocyto:
-                os.rename(sysOps.globaldatapath + "STARalignment" + str(amp_ind) + "/Aligned.out.sam",sysOps.globaldatapath + "Aligned" + str(amp_ind) + ".out.sam")
-            sysOps.sh("rm -r " + sysOps.globaldatapath + "STARalignment" + str(amp_ind) + "/")
-    '''
-    return
-            
-    
+            # --- STAGE 2: Quick Matching ---
+            sysOps.throw_status(f"STAGE 2: Quick matching for amp{amp_ind}")
+            if not sysOps.check_file_exists(label_pt_file, "./"):
+                if sysOps.check_file_exists(label_pt_file, "./") and os.path.exists(label_pt_file): os.remove(label_pt_file)
+                current_match_file_path_setting = match_str_list[amp_ind]
+                if current_match_file_path_setting:
+                    current_match_file_full_path = gd + current_match_file_path_setting
+                    if sysOps.check_file_exists(current_match_file_full_path, "./"):
+                        sysOps.throw_status(f'Performing quick-match using {current_match_file_full_path}')
+                        
+                        # ---------- build quick‑match awk programme ----------
+                        fmt_base      = "%s,%s,%d" + (",%s" if add_sequences_to_labelfiles else "") + "\\n"
+                        printf_arg_3  = ",$3" if add_sequences_to_labelfiles else ""
+                        patterns_for_awk_vars = []          # <-- MISSING in your draft
+                        awk_pattern_rules = []
+                        with open(current_match_file_full_path) as mf:
+                            for idx, raw in enumerate(mf):
+                                pattern = raw.strip()
+                                if not pattern:
+                                    continue
+                                m_idx = next((i for i, c in enumerate(pattern) if c != "N"), -1)
+                                if m_idx == -1:
+                                    continue
+                                awk_var = f"p{idx}"
+                                patterns_for_awk_vars.append((awk_var, pattern[m_idx:]))
+                                awk_pattern_rules.append(
+                                    f"""n=split($3,subs,";");
+                                       for(i=1;i<=n;i++) if(length(subs[i])>={m_idx+len(pattern[m_idx:])} &&
+                                            substr(subs[i],{m_idx+1},{len(pattern[m_idx:])})=={awk_var}){{
+                                                printf("{fmt_base}",$1,$2,{idx}{printf_arg_3});
+                                                printed=1; next;
+                                       }}"""
+                                )
+                        
+                        quick_match_awk = f"""BEGIN{{FS=",";OFS=","}}{{printed=0;{chr(10).join(awk_pattern_rules)}if(!printed) printf("{fmt_base}",$1,$2,-1{printf_arg_3});}}"""
+                        with open(quick_match_awk_script_path,"w") as fh: fh.write(quick_match_awk)
+                        vars = " ".join(f"-v {v}={escape_awk_var_for_shell(val)}" for v,val in patterns_for_awk_vars)
+                        sysOps.sh(f"awk {vars} -f {shlex.quote(quick_match_awk_script_path)} "
+                                  f"{shlex.quote(amp_trimmed_txt_out_file)} > {shlex.quote(label_pt_file)}")
+                    else: 
+                        sysOps.throw_status(f"Warning: Quick match file not found: {current_match_file_full_path}.")
+                
+                if not sysOps.check_file_exists(label_pt_file, "./"): 
+                    fmt_default = "%s,%s,-1" + (",%s" if add_sequences_to_labelfiles else "") + "\\n"
+                    default_args = ",$3" if add_sequences_to_labelfiles else ""
+                    sysOps.sh(
+                        f"""awk -F',' 'BEGIN{{OFS=","}}
+                           {{printf("{fmt_default}",$1,$2{default_args})}}' \
+                           {shlex.quote(amp_trimmed_txt_out_file)} > {shlex.quote(label_pt_file)}"""
+                    )
+
+            # --- STAGE 3: STAR Alignment and Annotation ---
+            if STARindexdir and gtffile:
+                sysOps.throw_status(f"STAGE 3: STAR Alignment for amp{amp_ind}")
+                if not os.path.exists(star_output_dir): os.makedirs(star_output_dir, exist_ok=True)
+                
+                if not sysOps.check_file_exists(star_sam_file, "./"):
+                    cmd_star = (f"STAR --genomeDir {shlex.quote(gd + STARindexdir)} --runThreadN 2 "
+                                f"--readFilesIn {shlex.quote(consensus_fasta_file_path)} "
+                                f"--outFileNamePrefix {shlex.quote(star_output_dir)} --outSAMtype SAM "
+                                f"--outSAMunmapped Within --outSAMattributes NH HI AS nM NM MD")
+                    sysOps.sh(cmd_star)
+                
+                if not sysOps.check_file_exists(final_sorted_alignments_for_merge, "./"):
+                    filter_sam_awk_path = os.path.join(script_dir, "filter_sam.awk") 
+                    if not os.path.exists(filter_sam_awk_path): raise FileNotFoundError(f"AWK script not found: {filter_sam_awk_path}")
+                    sysOps.sh(f"gawk -f {shlex.quote(filter_sam_awk_path)} {shlex.quote(star_sam_file)} > {shlex.quote(processed_alignments_txt)}")
+                    sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k3,3 -k7rn,7 -k5rn,5 ", processed_alignments_txt, tmp_sorted_aligned_sam_path, "./")
+                    sysOps.sh(f"awk -F, 'BEGIN{{prev_query=-1; prev_score=-1;}} {{if($3 != prev_query || prev_score==$7){{print ; prev_query=$3; prev_score=$7;}}}}' {shlex.quote(tmp_sorted_aligned_sam_path)} > {shlex.quote(sorted_aligned_sam_path_intermediate)}")
+                    sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k2,2 -k4n,4 ", sorted_aligned_sam_path_intermediate, final_sorted_alignments_for_merge, "./")
+                    for f_s3_sam_proc in [processed_alignments_txt, tmp_sorted_aligned_sam_path, sorted_aligned_sam_path_intermediate]:
+                        if sysOps.check_file_exists(f_s3_sam_proc, "./") and os.path.exists(f_s3_sam_proc): os.remove(f_s3_sam_proc)
+
+                if not sysOps.check_file_exists(gtf_sorted_file, "./"):
+                    gtf_parser_content = textwrap.dedent(f"""\
+                    BEGIN{{OFS=","}}
+                    {{
+                        gsub(/\\\"|;/,"", $0); 
+                        src_contig_col = $1; feature_col=$3; start_pos_col=$4; end_pos_col=$5; 
+                        gene_biotype_val="NONE"; gene_name_val="NONE"; transcript_name_val="NONE"; 
+                        gene_id_val="NONE"; transcript_id_val="NONE"; transcript_biotype_val="NONE"; 
+                        for(idx=1;idx<=NF-1;idx++){{
+                            if($idx == "gene_biotype"){{gene_biotype_val=$(idx+1);}} 
+                            else if($idx == "gene_name"){{gene_name_val=$(idx+1);}} 
+                            else if($idx == "transcript_id"){{transcript_id_val=$(idx+1);}}
+                            else if($idx == "transcript_name"){{transcript_name_val=$(idx+1);}} 
+                            else if($idx == "transcript_biotype"){{transcript_biotype_val=$(idx+1);}} 
+                            else if($idx == "gene_id"){{gene_id_val=$(idx+1);}} 
+                        }} 
+                        len_diff = start_pos_col - end_pos_col; if (len_diff < 0) len_diff = -len_diff;
+                        if ( len_diff <= 10000 ) {{
+                            print NR,src_contig_col,feature_col,start_pos_col,end_pos_col,gene_name_val,gene_biotype_val,(transcript_id_val!="NONE"?transcript_id_val:gene_id_val),transcript_name_val,transcript_biotype_val; 
+                            print NR,src_contig_col,feature_col,end_pos_col,start_pos_col,gene_name_val,gene_biotype_val,(transcript_id_val!="NONE"?transcript_id_val:gene_id_val),transcript_name_val,transcript_biotype_val;
+                        }}
+                    }}""")
+                    with open(gtf_awk_script_path, 'w') as f_awk_gtf: f_awk_gtf.write(gtf_parser_content)
+                    sysOps.sh(f"awk -f {shlex.quote(gtf_awk_script_path)} {shlex.quote(gd + gtffile)} > {shlex.quote(gtf_processed_file)}")
+                    sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k2,2 -k4n,4 ", gtf_processed_file, gtf_sorted_file, "./")
+                    if sysOps.check_file_exists(gtf_processed_file, "./") and os.path.exists(gtf_processed_file): os.remove(gtf_processed_file)
+                
+                if not sysOps.check_file_exists(merged_algn_gtf_file, "./"):
+                    cmd_merge_sort = (f"sort -k2,2 -k4n,4 -t ',' -m -T {shlex.quote(common_tmp_dir_for_sort)} "
+                                      f"{shlex.quote(final_sorted_alignments_for_merge)} {shlex.quote(gtf_sorted_file)} > {shlex.quote(merged_algn_gtf_file)}")
+                    sysOps.sh(cmd_merge_sort)
+                
+                sysOps.throw_status(f"Annotating alignments for amp{amp_ind}")
+                if sysOps.check_file_exists(tmp_umi_assignments_file, "./") and os.path.exists(tmp_umi_assignments_file): os.remove(tmp_umi_assignments_file)
+                current_overlapping_gtf_data_annot = [] 
+                current_gtf_nrs_active_annot = [] 
+                with open(tmp_umi_assignments_file, 'w') as f_umi_assign_out, \
+                     open(merged_algn_gtf_file, 'r') as f_merged_in:
+                    for line_content in f_merged_in:
+                        fields = line_content.strip().split(',')
+                        if not fields or not fields[0]: continue
+                        if fields[0] == "UMI": 
+                            if len(fields) < 8: sysOps.throw_status(f"Warning: Malformed alignment line (exp 8+ fields): {line_content.strip()}"); continue
+                            sam_src_contig_annot, sam_query_name_full_annot, sam_start_pos_annot = fields[1], fields[2], fields[3]
+                            sam_cigar_annot, sam_md_tag_annot = fields[5], fields[7]
+                            full_query_name_annot = sam_query_name_full_annot.split(':')[0]
+                            try: umi_idx_annot, sub_reads_annot, _ = full_query_name_annot.split('.')
+                            except ValueError: sysOps.throw_status(f"Warning: SAM query parse error '{full_query_name_annot}'"); continue
+                            mutation_str_annot = get_internal_mismatches(sam_cigar_annot, sam_md_tag_annot, sam_start_pos_annot)
+                            out_f = [umi_idx_annot, sam_start_pos_annot, mutation_str_annot]
+                            if current_overlapping_gtf_data_annot:
+                                unique_contigs = sorted(list(set(f[1] for f in current_overlapping_gtf_data_annot)))
+                                
+                                # PATCH A: Replace the problematic list comprehensions and fix the any() call
+                                unique_gene_names    = sorted({row[5] for row in current_overlapping_gtf_data_annot
+                                                               if len(row) > 5 and row[5] and row[5] != "NONE"})
+                                unique_gene_biotypes = sorted({row[6] for row in current_overlapping_gtf_data_annot
+                                                               if len(row) > 6 and row[6] and row[6] != "NONE"})
+                                unique_gene_ids      = sorted({row[7] for row in current_overlapping_gtf_data_annot
+                                                               if len(row) > 7 and row[7] and row[7] != "NONE"})
+                                unique_tx_names      = sorted({row[8] for row in current_overlapping_gtf_data_annot
+                                                               if len(row) > 8 and row[8] and row[8] != "NONE"})
+
+                                agg_contigs_a = "|".join(unique_contigs) if unique_contigs else sam_src_contig_annot 
+                                agg_gene_names_a = "|".join(unique_gene_names) if unique_gene_names else "NA"
+                                agg_gene_biotypes_a = "|".join(unique_gene_biotypes) if unique_gene_biotypes else "NA"
+                                agg_gene_ids_a = "|".join(unique_gene_ids) if unique_gene_ids else "NA" 
+                                agg_tx_names_a = "|".join(unique_tx_names) if unique_tx_names else "NA"
+                                
+                                gene_name_to_use_a = agg_gene_names_a if agg_gene_names_a != "NA" else agg_gene_ids_a 
+                                attn_rank_a = "3"
+                                if "rRNA" in agg_gene_biotypes_a:
+                                    attn_rank_a = "1"
+                                elif any(part.isdigit() for part in agg_contigs_a.split('|')) or "MT" in agg_contigs_a:
+                                    attn_rank_a = "2"
+                                
+                                out_f.extend([agg_contigs_a, gene_name_to_use_a, agg_gene_biotypes_a, agg_tx_names_a, 
+                                              sub_reads_annot, attn_rank_a, full_query_name_annot])
+                            else:
+                                out_f.extend([sam_src_contig_annot, "NA", "genome", "NA", sub_reads_annot, "4", full_query_name_annot])
+                            f_umi_assign_out.write(",".join(map(str, out_f)) + "\n")
+                        else: 
+                            if len(fields) < 1: continue; 
+                            gtf_nr_annot = fields[0]
+                            if gtf_nr_annot in current_gtf_nrs_active_annot:
+                                current_gtf_nrs_active_annot.remove(gtf_nr_annot)
+                                current_overlapping_gtf_data_annot = [f_item for f_item in current_overlapping_gtf_data_annot if f_item[0] != gtf_nr_annot]
+                            else:
+                                current_gtf_nrs_active_annot.append(gtf_nr_annot); current_overlapping_gtf_data_annot.append(fields)
+                # tmp_umi_assignments_file: 10 COLS (UMI_idx, ..., FQN)
+
+                sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k1,1 -k9n,9 -k10,10 ", tmp_umi_assignments_file, tmp_sorted_umi_assignments_file, "./")
+                if sysOps.check_file_exists(consolidated_umi_assignments_file, "./") and os.path.exists(consolidated_umi_assignments_file): os.remove(consolidated_umi_assignments_file)
+                with open(consolidated_umi_assignments_file, 'w') as f_consol_out, \
+                     open(tmp_sorted_umi_assignments_file, 'r') as f_sorted_assign_in:
+                    # ---- consolidation ----
+                    def flush_consol_line(key_tuple, recs, fh):
+                        """
+                        key_tuple = (UMI_idx, FQN)
+                        recs      = list of 9‑field slices [aln_start..attn_rank]
+                        Writes:   UMI, 7 merged cols, FQN              (9 columns)
+                        • preserves left‑to‑right order inside each pipe‑list
+                        • keeps duplicate items only once
+                        """
+                        if not key_tuple or not recs:
+                            return
+                        umi, fqn = key_tuple
+                        # transpose -> columns
+                        cols = list(zip(*recs))          # len(cols) == 8 (aln_start .. attn_rank)
+                        merged = []
+                        for col in cols:
+                            seen = set()
+                            ordered = []
+                            for v in col:
+                                if v not in seen:
+                                    seen.add(v)
+                                    ordered.append(v)
+                            merged.append("|".join(ordered))
+                        out_row = [umi] + merged + [fqn]
+                        fh.write(",".join(out_row) + "\n")
+                    
+                    current_key = None
+                    bucket      = []                     # accumulates 8‑field slices
+                    for ln in f_sorted_assign_in:
+                        fld = ln.rstrip().split(',')
+                        if len(fld) < 10:
+                            continue
+                        k = (fld[0], fld[9])             # (UMI, FQN)
+                        if k != current_key and current_key is not None:
+                            flush_consol_line(current_key, bucket, f_consol_out)
+                            bucket = []
+                        current_key = k
+                        bucket.append(fld[1:9])          # keep cols 1‑8 (incl. attn_rank)
+                    if current_key is not None:
+                        flush_consol_line(current_key, bucket, f_consol_out)
+                # consolidated_umi_assignments_file: UMI_idx(1), pipe_starts(2)...pipe_sub_reads(8), FQN(9) -- 9 COLS
+                
+                sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k2,2 ", gd + f"max_base_use_uxi{amp_ind}.txt", seqindex_sorted_uxi_path, "./")
+                sysOps.sh(f"join -t',' -1 2 -2 1 -o1.1,1.2,2.2 {shlex.quote(seqindex_sorted_uxi_path)} {shlex.quote(gd + f'seq_sort_clust_uxi{amp_ind}.txt')} > {shlex.quote(tmp_seq_sort_clust_path)}")
+                sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k3,3 ", tmp_seq_sort_clust_path, clust_sort_clust_path, "./")
+                sysOps.sh(
+                    f"join -t',' -1 3 -2 1 "
+                    f"-o1.1,1.2,"           # UMI_seq , uniqSeqIdx
+                    f"2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.9,2.10 "
+                    f"{shlex.quote(clust_sort_clust_path)} "
+                    f"{shlex.quote(consolidated_umi_assignments_file)} "
+                    f"> {shlex.quote(umi_seq_assignments_file_temp)}"
+                )
+                # umi_seq_assignments_file_temp: 10 COLS (UMI_seq, UniqSeqIdx, pipe_starts...pipe_sub_reads, FQN)
+
+                if add_sequences_to_labelfiles and sysOps.check_file_exists(trimmed_fragments_file_path, "./") \
+                                               and os.path.getsize(trimmed_fragments_file_path) > 0:
+                    sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k11,11 ", umi_seq_assignments_file_temp, tmp_assign_qname_path, "./") 
+                    sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k1,1 ", trimmed_fragments_file_path, tmp_frags_qname_path, "./")     
+                    sysOps.sh(f"join -t',' -1 11 -2 1 -o1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,1.10,2.2 "
+                              f"{shlex.quote(tmp_assign_qname_path)} {shlex.quote(tmp_frags_qname_path)} > {shlex.quote(final_umi_seq_assignments_path)}")
+                else:
+                    # fall‑back: just move or rename the temp file
+                    if os.path.exists(final_umi_seq_assignments_path) \
+                       and final_umi_seq_assignments_path != umi_seq_assignments_file_temp:
+                        os.remove(final_umi_seq_assignments_path)
+                    os.rename(umi_seq_assignments_file_temp, final_umi_seq_assignments_path)
+
+                sysOps.big_sort(f" {sort_temp_dir_option} -t',' -k1,1 ", final_umi_seq_assignments_path, sorted_assignments_file_path, "./")
+
+                # Clean up Stage 3 intermediates
+                stage3_intermediates_to_clean = [
+                    final_sorted_alignments_for_merge, gtf_sorted_file, merged_algn_gtf_file,
+                    consolidated_umi_assignments_file, tmp_umi_assignments_file, tmp_sorted_umi_assignments_file,
+                    seqindex_sorted_uxi_path, tmp_seq_sort_clust_path, clust_sort_clust_path,
+                    tmp_assign_qname_path, tmp_frags_qname_path
+                ]
+                if add_sequences_to_labelfiles and os.path.exists(final_umi_seq_assignments_path) and final_umi_seq_assignments_path != sorted_assignments_file_path:
+                     stage3_intermediates_to_clean.append(final_umi_seq_assignments_path)
+                if os.path.exists(umi_seq_assignments_file_temp) and umi_seq_assignments_file_temp != final_umi_seq_assignments_path : # if it wasn't renamed
+                    stage3_intermediates_to_clean.append(umi_seq_assignments_file_temp)
+
+                if sysOps.check_file_exists(sorted_assignments_file_path, "./"):
+                    for f_s3_intermed in stage3_intermediates_to_clean:
+                        if sysOps.check_file_exists(f_s3_intermed, "./") and os.path.exists(f_s3_intermed):
+                            try: os.remove(f_s3_intermed)
+                            except OSError as e: sysOps.throw_status(f"Warning: S3 intermed cleanup {f_s3_intermed} failed: {e}")
+            # End of STARindexdir and gtffile check (Stage 3)
+        # End of top-level file existence check for amp_ind loop
+        # End of for amp_ind loop
+
+        # --- STAGE 4: Calculate Gene Statistics ---
+        if sysOps.check_file_exists("sorted_umi_seq_assignments0.txt") and \
+           sysOps.check_file_exists("sorted_umi_seq_assignments1.txt"):
+            sysOps.throw_status("STAGE 4: Getting gene stats ...")
+            input_files_for_gene_stats = ["sorted_umi_seq_assignments0.txt", "sorted_umi_seq_assignments1.txt"]
+            gene_stats_results_list = get_gene_stats(input_files_for_gene_stats) 
+            with open(gd + "gene_stats.txt", 'w') as outfile:
+                outfile.write(",".join(map(str,gene_stats_results_list)))
+            sysOps.throw_status("Done getting gene stats.")
+
+        # --- STAGE 5: UEI (Unique Event Identifier) Matching ---
+        sysOps.throw_status("STAGE 5: UEI Matching.")
+        if uei_matchfilepath:
+            sysOps.throw_status(f"UEI matching to be performed with paths: {uei_matchfilepath}. "
+                                f"Input sorted_umi_seq_assignments*.txt is 10 columns (FQN or Seq in col 10).")
+            if sysOps.check_file_exists("sorted_umi_seq_assignments0.txt") and \
+                        sysOps.check_file_exists("sorted_umi_seq_assignments1.txt"):
+                lineID2UMIcluster_0 = {}
+                lineID2UMIcluster_1 = {}
+                with open(gd  + uei_matchfilepath + "line_sorted_clust_uxi0.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        lineID2UMIcluster_0[fields[0]] = fields[1]
+                with open(gd + uei_matchfilepath + "line_sorted_clust_uxi1.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        lineID2UMIcluster_1[fields[0]] = fields[1]
+                UMIseq2lineID_0 = {}
+                UMIseq2lineID_1 = {}
+                with open(gd + uei_matchfilepath + "sorted_indexed_uxi0.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        UMIseq2lineID_0[fields[3]] = fields[0]
+                with open(gd + uei_matchfilepath + "sorted_indexed_uxi1.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        UMIseq2lineID_1[fields[3]] = fields[0]
+                
+                UMIcluster2cdna_0 = {}
+                UMIcluster2cdna_1 = {}
+                with open(gd + "sorted_umi_seq_assignments0.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        umi_seq = fields[0]
+                        if umi_seq in UMIseq2lineID_0:
+                            line_id = UMIseq2lineID_0[umi_seq]
+                            if line_id in lineID2UMIcluster_0:
+                                umi_cluster = lineID2UMIcluster_0[line_id]
+                                if UMIcluster2cdna_0.get(umi_cluster) is None:
+                                    UMIcluster2cdna_0[umi_cluster] = []
+                                UMIcluster2cdna_0[umi_cluster].append("_".join([fields[4], fields[5], fields[8]]))
+                with open(gd + "sorted_umi_seq_assignments1.txt", 'r') as infile:
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        umi_seq = fields[0]
+                        if umi_seq in UMIseq2lineID_1:
+                            line_id = UMIseq2lineID_1[umi_seq]
+                            if line_id in lineID2UMIcluster_1:
+                                umi_cluster = lineID2UMIcluster_1[line_id]
+                                if UMIcluster2cdna_1.get(umi_cluster) is None:
+                                    UMIcluster2cdna_1[umi_cluster] = []
+                                UMIcluster2cdna_1[umi_cluster].append("_".join([fields[4], fields[5], fields[8]]))
+
+                with open(gd + uei_matchfilepath + "uei_assoc_slgrps.txt", 'r') as infile, \
+                     open(gd + uei_matchfilepath + "uei_assoc_matched.txt", 'w+') as outfile:
+                    outfile.write(",".join(["UMI_cluster0", "UMI_cluster1", "cDNA0", "cDNA1", "UEI_count_class1", "UEI_count_class2"]) + "\n")
+                    for line in infile:
+                        fields = line.strip().split(",")
+                        umi_cluster0 = fields[1]
+                        umi_cluster1 = fields[2]
+                        if umi_cluster0 in UMIcluster2cdna_0:
+                            cdna0 = ";".join(UMIcluster2cdna_0[umi_cluster0])
+                        else:
+                            cdna0 = "."
+                        if umi_cluster1 in UMIcluster2cdna_1:
+                            cdna1 = ";".join(UMIcluster2cdna_1[umi_cluster1])
+                        else:
+                            cdna1 = "."
+                        
+                        outfile.write(f"{umi_cluster0},{umi_cluster1},{cdna0},{cdna1},{fields[5]},{fields[6]}\n")
+            else:
+                sysOps.throw_status("STAGE 5: UEI matching skipped (sorted_umi_seq_assignments*.txt missing).")
+        else:
+            sysOps.throw_status("STAGE 5: UEI Matching skipped (no uei_matchfilepath provided).")
+
+        sysOps.throw_status(f"get_amp_consensus processing completed.")
+        
+    if True: 
+        sysOps.throw_status("Cleaning up ephemeral temporary files (AWK scripts etc.)...")
+        unique_ephemeral_files = sorted(list(set(ephemeral_temp_files_overall))) 
+        for temp_file_path in unique_ephemeral_files:
+            if os.path.exists(temp_file_path):
+                try: os.remove(temp_file_path)
+                except OSError as e: sysOps.throw_status(f"Warning: Could not remove ephemeral temp file {temp_file_path}. Error: {e}")
+        
+        for amp_ind_final_clean in range(2):
+            star_dir_to_clean_final = gd + f"STARalignment{amp_ind_final_clean}/"
+            if STARindexdir and gtffile and os.path.isdir(star_dir_to_clean_final):
+                if sysOps.check_file_exists(f"sorted_umi_seq_assignments{amp_ind_final_clean}.txt", "./"):
+                    sysOps.throw_status(f"Cleaning up completed STAR directory: {star_dir_to_clean_final}")
+                    try: sysOps.sh(f"rm -rf {shlex.quote(star_dir_to_clean_final)}") 
+                    except Exception as e: sysOps.throw_status(f"Warning: Could not remove STAR dir {star_dir_to_clean_final}. Error: {e}")
+        sysOps.throw_status("Ephemeral temporary file cleanup attempt complete.")
+    # No explicit return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def assign_umi_pairs(uei_ind):
     # uei_ind will always be >=2; outputfile is uei*_assoc.txt
     
